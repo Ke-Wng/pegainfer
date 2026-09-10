@@ -124,7 +124,7 @@ pub(super) fn admit_pending_requests<T>(
             continue;
         }
 
-        let request_pages = pages_needed(max_kv_tokens(prompt_len, max_tokens), page_size);
+        let request_pages = request_lifetime_pages(prompt_len, max_tokens, page_size);
         if request_pages > max_request_pages {
             rejected.push((req, RejectReason::KvBudget));
             continue;
@@ -151,12 +151,19 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
-// Prefill samples the first output token but does not append it to KV. A
-// generated token occupies KV only when it is fed as the next decode input.
-// Therefore N returned completion tokens occupy at most N - 1 generated-token
-// KV slots.
-pub(super) fn max_kv_tokens(prompt_len: usize, max_tokens: usize) -> usize {
-    prompt_len.saturating_add(max_tokens.saturating_sub(1))
+// One-token completions finish after prefill, before schedule_decode provisions
+// a dangling generation block. Multi-token requests can draw that extra block,
+// so admission reserves prompt + max_tokens for their lifetime peak.
+fn request_lifetime_pages(prompt_len: usize, max_tokens: usize, page_size: usize) -> usize {
+    pages_needed(request_lifetime_tokens(prompt_len, max_tokens), page_size)
+}
+
+pub(super) fn request_lifetime_tokens(prompt_len: usize, max_tokens: usize) -> usize {
+    if max_tokens <= 1 {
+        prompt_len
+    } else {
+        prompt_len.saturating_add(max_tokens)
+    }
 }
 
 fn current_active_tokens(req: ActiveKvBudget) -> usize {
@@ -168,7 +175,7 @@ fn active_future_pages(active: &[ActiveKvBudget], page_size: usize) -> usize {
     active
         .iter()
         .map(|req| {
-            let max_pages = pages_needed(max_kv_tokens(req.prompt_len, req.max_tokens), page_size);
+            let max_pages = request_lifetime_pages(req.prompt_len, req.max_tokens, page_size);
             let current_pages = pages_needed(current_active_tokens(*req), page_size);
             assert!(
                 current_pages <= max_pages,
@@ -196,7 +203,7 @@ pub(super) fn prefilling_future_pages(prefilling: &[PrefillKvBudget], page_size:
     prefilling
         .iter()
         .map(|req| {
-            let max_pages = pages_needed(max_kv_tokens(req.prompt_len, req.max_tokens), page_size);
+            let max_pages = request_lifetime_pages(req.prompt_len, req.max_tokens, page_size);
             let current_pages = pages_needed(req.current_tokens, page_size);
             assert!(
                 current_pages <= max_pages,
@@ -244,6 +251,8 @@ pub(super) fn compaction_after_retire(
 
 #[cfg(test)]
 mod tests {
+    use pegainfer_kv_cache::BlockPool;
+
     use super::*;
 
     #[derive(Clone, Debug)]
@@ -727,13 +736,13 @@ mod tests {
     fn admission_counts_pending_generation_budget() {
         let outcome = admit_pending_requests(
             vec![
-                pending_with_max(1, 16, 17), // 32 KV tokens -> 2 pages
-                pending(2, 16),              // 16 KV tokens -> 1 page
+                pending_with_max(1, 16, 17), // 33-token peak -> 3 pages
+                pending(2, 16),              // 16-token peak -> 1 page
             ],
             &[],
             8,
             16,
-            2,
+            3,
             8,
             usize::MAX,
             |req| req.prompt_len,
@@ -755,23 +764,23 @@ mod tests {
             ActiveKvBudget {
                 prompt_len: 16,
                 generated_count: 1, // current 16 tokens -> 1 page
-                max_tokens: 33,     // max 48 KV tokens -> 3 pages
+                max_tokens: 33,     // 49-token lifetime peak -> 4 pages
             },
             ActiveKvBudget {
                 prompt_len: 16,
                 generated_count: 17, // current 32 tokens -> 2 pages
-                max_tokens: 17,      // max 32 KV tokens -> 2 pages
+                max_tokens: 17,      // 33-token lifetime peak -> 3 pages
             },
             ActiveKvBudget {
                 prompt_len: 9,
                 generated_count: 8, // current 16 tokens -> 1 page
-                max_tokens: 24,     // max 32 KV tokens -> 2 pages
+                max_tokens: 24,     // 33-token lifetime peak -> 3 pages
             },
         ];
 
         assert_eq!(
             active_future_pages(&active, 16),
-            3,
+            6,
             "active admission reserves only future page growth, not pages already held"
         );
     }
@@ -781,14 +790,14 @@ mod tests {
         let active = [ActiveKvBudget {
             prompt_len: 16,
             generated_count: 1, // current 16 tokens -> 1 page
-            max_tokens: 49,     // max 64 KV tokens -> 4 pages; future growth = 3 pages
+            max_tokens: 49,     // 65-token lifetime peak -> 5 pages; future growth = 4 pages
         }];
         let outcome = admit_pending_requests(
             vec![pending(1, 16), pending(2, 16)],
             &active,
             8,
             16,
-            4,
+            5,
             8,
             usize::MAX,
             |req| req.prompt_len,
@@ -808,7 +817,7 @@ mod tests {
     fn admission_rejects_impossible_request_without_blocking_later_fit() {
         let outcome = admit_pending_requests(
             vec![
-                pending_with_max(1, 16, 65), // 80 KV tokens -> 5 pages
+                pending_with_max(1, 16, 65), // 81-token peak -> 6 pages
                 pending(2, 16),
             ],
             &[],
@@ -833,7 +842,7 @@ mod tests {
     #[test]
     fn admission_allows_request_at_single_request_page_cap() {
         let outcome = admit_pending_requests(
-            vec![pending_with_max(1, 16, 49)], // 64 KV tokens -> 4 pages
+            vec![pending_with_max(1, 16, 48)], // 64-token peak -> 4 pages
             &[],
             1,
             16,
@@ -849,9 +858,48 @@ mod tests {
         assert!(outcome.rejected.is_empty());
     }
 
+    fn kvbm_peak_pages(prompt_len: usize, max_tokens: usize, page_size: usize) -> usize {
+        let pool = BlockPool::new(page_size, 256).expect("test block pool");
+        let baseline = pool.available_blocks();
+        let mut peak = 0;
+        let mut kv = pool.new_request(vec![1; prompt_len], max_tokens, None);
+
+        kv.schedule_prefill(prompt_len, &pool)
+            .expect("schedule prefill");
+        peak = peak.max(baseline - pool.available_blocks());
+        kv.apply_prefill(100, &pool).expect("apply prefill");
+        for step in 1..max_tokens {
+            kv.schedule_decode(&pool).expect("schedule decode");
+            peak = peak.max(baseline - pool.available_blocks());
+            kv.apply_decode(100 + step as u32, &pool)
+                .expect("apply decode");
+        }
+        kv.release().expect("release request KV");
+        assert_eq!(pool.available_blocks(), baseline);
+        peak
+    }
+
+    #[test]
+    fn lifetime_pages_cover_request_kv_peak_draw() {
+        let page_size = 16;
+        assert_eq!(request_lifetime_pages(16, 17, page_size), 3);
+        assert_eq!(kvbm_peak_pages(16, 17, page_size), 3);
+
+        for prompt_len in 1..=32 {
+            for max_tokens in 1..=32 {
+                let reserved = request_lifetime_pages(prompt_len, max_tokens, page_size);
+                let peak = kvbm_peak_pages(prompt_len, max_tokens, page_size);
+                assert!(
+                    reserved >= peak,
+                    "prompt={prompt_len}, max_tokens={max_tokens}: reserved={reserved}, peak={peak}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn one_token_completion_on_page_boundary_uses_only_prompt_page() {
-        assert_eq!(max_kv_tokens(16, 1), 16);
+        assert_eq!(request_lifetime_pages(16, 1, 16), 1);
         let outcome = admit_pending_requests(
             vec![pending_with_max(1, 16, 1)],
             &[],
@@ -949,13 +997,13 @@ mod tests {
 
     #[test]
     fn prefilling_future_pages_reserves_only_remaining_growth() {
-        // current 16 tokens -> 1 page; max 48 KV tokens -> 3 pages; future = 2.
+        // Current 16 tokens use 1 page; the 49-token lifetime peak uses 4.
         let prefilling = [PrefillKvBudget {
             current_tokens: 16,
             prompt_len: 16,
             max_tokens: 33,
         }];
-        assert_eq!(prefilling_future_pages(&prefilling, 16), 2);
+        assert_eq!(prefilling_future_pages(&prefilling, 16), 3);
     }
 
     #[test]
@@ -964,14 +1012,14 @@ mod tests {
             PrefillKvBudget {
                 current_tokens: 0, // just admitted, nothing in KV yet -> 0 pages
                 prompt_len: 16,
-                max_tokens: 17, // max 32 KV tokens -> 2 pages; future = 2
+                max_tokens: 17, // 33-token lifetime peak -> 3 pages
             },
             PrefillKvBudget {
                 current_tokens: 32, // 2 pages held
                 prompt_len: 40,
-                max_tokens: 9, // max 48 KV tokens -> 3 pages; future = 1
+                max_tokens: 9, // 49-token lifetime peak -> 4 pages; future = 2
             },
         ];
-        assert_eq!(prefilling_future_pages(&prefilling, 16), 3);
+        assert_eq!(prefilling_future_pages(&prefilling, 16), 5);
     }
 }

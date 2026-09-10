@@ -55,7 +55,6 @@ use self::plan::RejectReason;
 use self::plan::admit_pending_requests;
 use self::plan::choose_prefill_budget;
 use self::plan::compaction_after_retire;
-use self::plan::max_kv_tokens;
 use self::plan::plan_prefill_chunks;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
@@ -911,7 +910,8 @@ fn scheduler_loop(
         }
 
         // 6. Move freshly admitted prompts into the chunked-prefill queue.
-        for req in admission.pending {
+        let mut admitted = admission.pending.into_iter();
+        while let Some(req) = admitted.next() {
             debug!(
                 "request admitted: request_id={:?} prompt_len={} max_tokens={}",
                 req.request_id,
@@ -934,17 +934,34 @@ fn scheduler_loop(
                         req,
                     });
                 }
-                Err(e) => {
-                    warn!("failed to allocate recurrent state for new request: {e}");
+                Err(AdmissionError::Recoverable(error)) => {
+                    warn!("failed to admit new request: {error}");
                     let _ = req.token_tx.send(TokenEvent::Error {
-                        message: e.to_string(),
+                        message: error.to_string(),
                         prompt_tokens: req.prompt_tokens.len(),
                         completion_tokens: 0,
                     });
                 }
+                Err(AdmissionError::Fatal(error)) => {
+                    let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                    let failure = FatalSchedulerError::new(error.to_string())
+                        .with_request(req)
+                        .with_requests(admitted);
+                    terminal_scheduler_shutdown(
+                        &mut submit_rx,
+                        &load_tx,
+                        kv_total_blocks,
+                        active,
+                        prefilling,
+                        Vec::new(),
+                        admission.deferred,
+                        inflight_prefill.take(),
+                        failure,
+                    );
+                    return;
+                }
             }
         }
-
         deferred = admission.deferred;
 
         // 7. Choose this tick's prefill budget, take that chunk off the front of
@@ -1056,7 +1073,8 @@ fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
             req.max_tokens
         ),
         RejectReason::KvBudget => {
-            let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+            let max_request_tokens =
+                plan::request_lifetime_tokens(req.prompt_tokens.len(), req.max_tokens);
             format!(
                 "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={max_request_tokens}",
                 req.prompt_tokens.len()
@@ -1096,9 +1114,11 @@ fn prefill_batch(
             let prefill_sample_seed = rand::RngExt::random(rng);
             match single.sample_prefill_logits(&chunk.reqs, &logits, prefill_sample_seed) {
                 Ok((tokens, logprobs)) => {
-                    single
-                        .apply_prefill(&mut chunk, &tokens)
-                        .map_err(|e| FatalSchedulerError::new(e.to_string()))?;
+                    if let Err(error) = single.apply_prefill(&mut chunk, &tokens) {
+                        return Err(
+                            FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs)
+                        );
+                    }
                     PrefillStepArtifacts::Single { tokens, logprobs }
                 }
                 Err(e) => {
@@ -1174,9 +1194,9 @@ fn finish_async_prefill(
             return Ok(());
         }
     };
-    single
-        .apply_prefill(&mut chunk, &tokens)
-        .map_err(|e| FatalSchedulerError::new(e.to_string()))?;
+    if let Err(error) = single.apply_prefill(&mut chunk, &tokens) {
+        return Err(FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs));
+    }
     let artifacts = PrefillStepArtifacts::Single { tokens, logprobs };
     promote_or_requeue(single, active, prefilling, chunk, &artifacts)
 }
@@ -1249,8 +1269,10 @@ fn unified_step_sched(
 
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
-    if output.decoded {
-        process_decode_logits(backend, active, decode_seed)?;
+    if output.decoded
+        && let Err(failure) = process_decode_logits(backend, active, decode_seed)
+    {
+        return Err(failure.with_requests(chunk.reqs));
     }
 
     let prefill_logits = output
@@ -1266,9 +1288,9 @@ fn unified_step_sched(
                 return Ok(());
             }
         };
-    backend
-        .apply_prefill(&mut chunk, &tokens)
-        .map_err(|e| FatalSchedulerError::new(e.to_string()))?;
+    if let Err(error) = backend.apply_prefill(&mut chunk, &tokens) {
+        return Err(FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs));
+    }
     let prefill = PrefillStepArtifacts::Single { tokens, logprobs };
     promote_or_requeue(backend, active, prefilling, chunk, &prefill)
 }

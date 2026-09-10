@@ -151,7 +151,6 @@ struct SnapshotEntry {
 struct SnapshotGuard {
     boundary: usize,
     entry: Arc<SnapshotEntry>,
-    started: Instant,
 }
 
 struct SnapshotReservation {
@@ -282,9 +281,9 @@ The implementation acceptance surface should include:
 - mixed cold and warm requests in the same prefill/unified step;
 - pool-full behavior proving insertion skip preserves cold output;
 - real GPU cold-vs-warm HF logits gates, including resumed suffix prefill and decode-slot promotion;
-- retained metrics for snapshot D2D copy time, cold insertion overhead, warm TTFT, joint hit length, and slot occupancy.
+- retained cache metrics for joint hits, hit length, misses, insertions, evictions, and slot occupancy.
 
-Those measurements determine whether 256 remains the right stride. They must not be replaced by the old RTX 4090 CPU-transfer estimates, which measured a deferred design and a different snapshot shape.
+The cold/warm measurements below guide future stride changes. They must not be replaced by the old RTX 4090 CPU-transfer estimates, which measured a deferred design and a different snapshot shape.
 
 ## Performance Result (2026-08-06)
 

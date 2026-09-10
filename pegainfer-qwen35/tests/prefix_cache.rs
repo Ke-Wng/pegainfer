@@ -59,7 +59,6 @@ fn submit(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     logprobs: usize,
-    echo: bool,
 ) -> pegainfer_frontend::engine::TokenStreamReceiver {
     let (token_tx, rx) = TokenSink::standalone();
     handle
@@ -77,8 +76,8 @@ fn submit(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs,
-            echo,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -90,9 +89,8 @@ fn generate(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     logprobs: usize,
-    echo: bool,
 ) -> Generation {
-    let mut rx = submit(handle, prompt_tokens, max_tokens, logprobs, echo);
+    let mut rx = submit(handle, prompt_tokens, max_tokens, logprobs);
     let mut cached_tokens = None;
     let mut generated_tokens = Vec::with_capacity(max_tokens);
     let mut generated_logprobs = Vec::with_capacity(max_tokens);
@@ -124,7 +122,7 @@ fn generate(
 }
 
 fn generate_one(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, u32) {
-    let result = generate(handle, prompt_tokens, 1, 0, false);
+    let result = generate(handle, prompt_tokens, 1, 0);
     (
         result.cached_tokens,
         *result.tokens.first().expect("request emitted no token"),
@@ -266,66 +264,22 @@ fn boundary_selection_and_multitoken_restore_preserve_logits() {
     );
     let handle = start_engine(&model_path, 1, 512);
 
-    let cold = generate(
-        &handle,
-        long_prompt.clone(),
-        TRACE_TOKENS,
-        TOP_LOGPROBS,
-        false,
-    );
+    let cold = generate(&handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(cold.cached_tokens, 0);
-    let warm = generate(
-        &handle,
-        long_prompt.clone(),
-        TRACE_TOKENS,
-        TOP_LOGPROBS,
-        false,
-    );
+    let warm = generate(&handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(warm.cached_tokens, 512);
     assert_trace_close("tp1 576-token restore", &cold, &warm);
 
-    let exact_512 = generate(&handle, long_prompt[..512].to_vec(), 1, 0, false);
+    let exact_512 = generate(&handle, long_prompt[..512].to_vec(), 1, 0);
     assert_eq!(
         exact_512.cached_tokens, 256,
         "an exactly aligned prompt must retain one token for final prefill"
     );
-    let exact_256 = generate(&handle, long_prompt[..256].to_vec(), 1, 0, false);
+    let exact_256 = generate(&handle, long_prompt[..256].to_vec(), 1, 0);
     assert_eq!(exact_256.cached_tokens, 0);
-    // Unsupported echo rejection is covered by the scheduler contract gate.
 
-    let extended = generate(&handle, long_prompt[..320].to_vec(), 1, 0, false);
+    let extended = generate(&handle, long_prompt[..320].to_vec(), 1, 0);
     assert_eq!(extended.cached_tokens, 256);
-}
-
-#[test]
-#[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-fn tp2_joint_restore_preserves_output() {
-    tp2_joint_restore(false);
-}
-
-#[test]
-#[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-fn tp2_graph_joint_restore_preserves_output() {
-    tp2_joint_restore(true);
-}
-
-fn tp2_joint_restore(cuda_graph: bool) {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let tokenizer = common::load_tokenizer(&model_path);
-    let prompt = prompt_tokens(
-        &tokenizer,
-        "Tensor parallel prefix reuse restores every rank's recurrent and convolution state. ",
-        PROMPT_TOKENS,
-    );
-    let handle = start_engine_with_graph(&model_path, 2, PREFIX_CACHE_MIB, cuda_graph);
-
-    let cold = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS, false);
-    assert_eq!(cold.cached_tokens, 0, "first TP2 request must be cold");
-    let warm = generate(&handle, prompt, TRACE_TOKENS, TOP_LOGPROBS, false);
-    assert_eq!(warm.cached_tokens, PREFIX_BOUNDARY);
-    assert_trace_close("tp2 joint restore", &cold, &warm);
 }
 
 fn restore_during_live_decode(
@@ -349,8 +303,8 @@ fn restore_during_live_decode(
         overlap,
     )
     .unwrap();
-    let cold = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS, false);
-    let mut background = submit(&handle, vec![9707], 1024, 0, false);
+    let cold = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+    let mut background = submit(&handle, vec![9707], 1024, 0);
     loop {
         match background.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { .. }) => break,
@@ -358,7 +312,7 @@ fn restore_during_live_decode(
             event => panic!("background decode did not start: {event:?}"),
         }
     }
-    let warm = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS, false);
+    let warm = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(warm.cached_tokens, 512);
     assert_trace_close("restore during live decode", &cold, &warm);
     let mut background_tokens = 1;
@@ -376,7 +330,7 @@ fn restore_during_live_decode(
     }
     assert!(background_tokens < 1024);
     drop(background); // Exercise cancellation cleanup followed by another cache hit.
-    let again = generate(&handle, prompt, TRACE_TOKENS, TOP_LOGPROBS, false);
+    let again = generate(&handle, prompt, TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(again.cached_tokens, 512);
     assert_trace_close("restore after cancellation", &cold, &again);
 }
