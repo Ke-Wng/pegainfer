@@ -824,10 +824,10 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
         }
     };
 
-    let kv = rejection_message(RejectReason::KvBudget, 65);
+    let kv = rejection_message(RejectReason::KvBudget, 49);
     assert!(
-        kv.contains("max_request_tokens=80"),
-        "rejection should report the full lifetime KV request: {kv}"
+        kv.contains("max_request_tokens=65"),
+        "rejection should report the lifetime KV peak used by admission: {kv}"
     );
 
     let context = rejection_message(RejectReason::ContextLength { limit: 32 }, 17);
@@ -842,13 +842,18 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
 }
 
 #[test]
-fn echo_request_is_rejected_before_backend_admission() {
-    let (echo_tx, mut echo_rx) = TokenSink::standalone();
+fn prompt_logprobs_request_is_rejected_before_backend_admission() {
+    let (unsupported_tx, mut unsupported_rx) = TokenSink::standalone();
     let (regular_tx, mut regular_rx) = TokenSink::standalone();
-    let mut echo = test_request_with_shape("unsupported-echo", echo_tx, vec![1, 2, 3], 4);
-    echo.prompt_logprobs = Some(0);
+    let mut unsupported = test_request_with_shape(
+        "unsupported-prompt-logprobs",
+        unsupported_tx,
+        vec![1, 2, 3],
+        4,
+    );
+    unsupported.prompt_logprobs = Some(0);
     let regular = test_request("regular", regular_tx);
-    let mut pending = vec![echo, regular];
+    let mut pending = vec![unsupported, regular];
 
     reject_unsupported_prompt_logprobs(&mut pending);
 
@@ -858,7 +863,7 @@ fn echo_request_is_rejected_before_backend_admission() {
         pending[0].prompt_logprobs.is_none(),
         "only requests eligible for backend admission may remain"
     );
-    match echo_rx.blocking_recv().map(|(_, event)| event) {
+    match unsupported_rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected {
             message,
             prompt_tokens,
@@ -868,7 +873,7 @@ fn echo_request_is_rejected_before_backend_admission() {
             assert_eq!(prompt_tokens, 3);
             assert_eq!(completion_tokens, 0);
         }
-        event => panic!("expected unsupported echo rejection, got {event:?}"),
+        event => panic!("expected unsupported prompt-logprobs rejection, got {event:?}"),
     }
     assert!(matches!(
         regular_rx.try_recv(),

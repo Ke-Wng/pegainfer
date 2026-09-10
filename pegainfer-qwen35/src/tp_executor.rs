@@ -61,6 +61,20 @@ const TP_PRECAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const TP_RUNTIME_MEMORY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
 
+#[derive(Debug)]
+pub(crate) enum TpBeginRequestError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl TpBeginRequestError {
+    pub(crate) fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Recoverable(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
 /// One controller-barriered phase of the TP decode-graph pre-capture sweep.
 ///
 /// Capture and launch are separate phases because a captured collective's
@@ -520,25 +534,27 @@ impl Qwen35TpExecutor {
         max_output_tokens: usize,
         lora_name: Option<&str>,
         allow_match: bool,
-    ) -> Result<usize> {
-        anyhow::ensure!(
-            !self.request_kvs.contains_key(&request_id),
-            "Qwen3.5 TP request {} already exists",
-            request_id.get()
-        );
-        let (mut kv, restore) = self.kv_cache.begin_request(
-            prompt_tokens,
-            max_output_tokens,
-            lora_name,
-            allow_match,
-        )?;
+    ) -> Result<usize, TpBeginRequestError> {
+        self.poison
+            .ensure_healthy()
+            .map_err(TpBeginRequestError::Fatal)?;
+        if self.request_kvs.contains_key(&request_id) {
+            return Err(TpBeginRequestError::Recoverable(anyhow::anyhow!(
+                "Qwen3.5 TP request {} already exists",
+                request_id.get()
+            )));
+        }
+        let (mut kv, restore) = self
+            .kv_cache
+            .begin_request(prompt_tokens, max_output_tokens, lora_name, allow_match)
+            .map_err(TpBeginRequestError::Recoverable)?;
         let boundary = restore.as_ref().map_or(0, SnapshotGuard::boundary);
         let snapshot_slot = restore.as_ref().map(SnapshotGuard::recurrent_slot);
         let positions = match self.broadcast_restore_request(request_id, snapshot_slot, boundary) {
             Ok(positions) => positions,
             Err(error) => {
                 let _ = self.kv_cache.release_request(&mut kv);
-                return Err(error);
+                return Err(TpBeginRequestError::Fatal(error));
             }
         };
         let cached_tokens = if let Some(restore) = restore {
@@ -547,7 +563,9 @@ impl Qwen35TpExecutor {
                 Err(error) => {
                     let _ = self.drop_request(request_id, DropExpectation::MustExist);
                     let _ = self.kv_cache.release_request(&mut kv);
-                    return Err(self.poison_after_mutation("request restore", &error));
+                    return Err(TpBeginRequestError::Fatal(
+                        self.poison_after_mutation("request restore", &error),
+                    ));
                 }
             }
         } else {
@@ -557,7 +575,9 @@ impl Qwen35TpExecutor {
                 let error = anyhow::anyhow!(
                     "Qwen3.5 TP cold request restored non-zero positions {positions:?}"
                 );
-                return Err(self.poison_after_mutation("request restore", &error));
+                return Err(TpBeginRequestError::Fatal(
+                    self.poison_after_mutation("request restore", &error),
+                ));
             }
             0
         };
@@ -576,7 +596,7 @@ impl Qwen35TpExecutor {
     pub(crate) fn log_prefix_cache_stats(&self) {
         let stats = self.kv_cache.stats();
         log::info!(
-            "Qwen3.5 TP prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, restore_ms={:.3}, occupancy={}/{}",
+            "Qwen3.5 TP prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
             self.world_size,
             stats.joint_hits,
             stats.joint_hit_tokens,
@@ -584,7 +604,6 @@ impl Qwen35TpExecutor {
             stats.snapshot_misses,
             stats.inserts,
             stats.evictions,
-            stats.restore_ns as f64 / 1_000_000.0,
             self.kv_cache.snapshot_occupancy(),
             self.kv_cache.snapshot_slots(),
         );
@@ -741,6 +760,7 @@ impl Qwen35TpExecutor {
             KvCacheManager::from_buffer(first.kv_buffer().clone(), min_capacity_pages)?,
             snapshot_slots,
         )?;
+        let padding_block_id = kv_cache.pool().padding_block_id();
         let capacity_pages_for_requests = min_capacity_pages.saturating_sub(1);
         let max_position_embeddings = first.config().max_position_embeddings;
         let eos_token_id = first.config().eos_token_id;
@@ -761,6 +781,7 @@ impl Qwen35TpExecutor {
                 max_batch,
                 max_prefill_tokens,
                 graph_enabled,
+                padding_block_id,
                 nccl_id,
                 Arc::clone(&startup_gate),
                 Arc::clone(&effective_max_batch),
@@ -1010,6 +1031,7 @@ impl Qwen35TpExecutor {
                 None,
                 false,
             ) {
+                let error = error.into_inner();
                 // Once an earlier request commits, a later failure leaves a
                 // partially admitted plan; the executor must not keep serving.
                 if index == 0 {
@@ -1563,6 +1585,7 @@ impl TpWorker {
         max_batch: usize,
         max_prefill_tokens: usize,
         graph_enabled: bool,
+        padding_block_id: i32,
         nccl_id: cudarc::nccl::safe::Id,
         startup_gate: Arc<TpStartupGate>,
         effective_max_batch: Arc<AtomicUsize>,
@@ -1588,6 +1611,7 @@ impl TpWorker {
                         max_batch,
                         max_prefill_tokens,
                         graph_enabled,
+                        padding_block_id,
                     );
                     let prepared = match prepared {
                         Ok((prepared, rank_max_batch)) => {
@@ -1688,6 +1712,7 @@ struct TpWorkerPrepared {
     world_size: usize,
     max_batch: usize,
     model: Qwen35Model,
+    padding_block_id: i32,
     decode_buffers: BatchDecodeBuffers35,
     sample_scratch: pegainfer_sample::SampleScratch,
     cublas_guard: CublasThreadGuard,
@@ -1724,6 +1749,7 @@ impl TpWorkerPrepared {
         requested_max_batch: usize,
         max_prefill_tokens: usize,
         graph_enabled: bool,
+        padding_block_id: i32,
     ) -> Result<(Self, usize)> {
         let cublas_guard = bind_worker_thread(&model)?;
         let snapshots = RecurrentStateStore::new(
@@ -1803,7 +1829,7 @@ impl TpWorkerPrepared {
         let decode_buffers = model.create_batch_decode_buffers_with_capacity(
             max_batch,
             model.kv_buffer().num_blocks(),
-            (model.kv_buffer().num_blocks() - 1) as i32,
+            padding_block_id,
         )?;
         let sample_scratch = pegainfer_sample::SampleScratch::new(
             model.device_ctx(),
@@ -1817,6 +1843,7 @@ impl TpWorkerPrepared {
                 world_size,
                 max_batch,
                 model,
+                padding_block_id,
                 decode_buffers,
                 sample_scratch,
                 cublas_guard,
@@ -1838,6 +1865,7 @@ impl TpWorkerPrepared {
             world_size,
             max_batch,
             mut model,
+            padding_block_id,
             decode_buffers,
             sample_scratch,
             cublas_guard,
@@ -1869,7 +1897,7 @@ impl TpWorkerPrepared {
             let graph_state = model.create_batch_decode_graph_state_with_capacity(
                 slots,
                 model.kv_buffer().num_blocks(),
-                (model.kv_buffer().num_blocks() - 1) as i32,
+                padding_block_id,
             )?;
             (Some(graph_state), vec![None; slots])
         } else {
@@ -3529,8 +3557,9 @@ mod tests {
 
     #[test]
     fn validates_prefill_layout_before_admission() {
-        let request =
-            |id, tokens| TpPrefillChunkItem::new(RequestId::new(id), vec![9707; tokens], 0, true);
+        let request = |id, tokens| {
+            TpPrefillChunkItem::new(RequestId::new(id), vec![9707; tokens], None, true)
+        };
 
         validate_prefill_layout(&[request(1, 2)], 2, 4, 1, |_| false)
             .expect("one new request fits the remaining slot and context");
@@ -3694,16 +3723,19 @@ mod tests {
             .disconnect_worker_receiver_for_test(1)
             .expect("disconnect rank-1 worker receiver");
 
-        let err = executor
-            .execute_prefill(PrefillPlan {
-                requests: &[PrefillStepItem::new(
-                    RequestId::new(420),
-                    vec![151_646, 9707],
-                    None,
-                )],
-            })
-            .unwrap_err()
-            .to_string();
+        let error = executor
+            .begin_request(
+                RequestId::new(420),
+                &[151_646, 9707],
+                executor.max_position_embeddings - 2,
+                None,
+                false,
+            )
+            .unwrap_err();
+        let TpBeginRequestError::Fatal(error) = error else {
+            panic!("worker disconnect must be fatal")
+        };
+        let err = error.to_string();
         assert!(
             err.contains("failed to dispatch RestoreRequest to TP worker rank 1"),
             "unexpected error: {err}"
@@ -3724,8 +3756,8 @@ mod tests {
                 .expect("start TP2 executor");
         let request_id = RequestId::new(430);
         let duplicate = [
-            PrefillStepItem::new(request_id, vec![151_646, 9707], 0),
-            PrefillStepItem::new(request_id, vec![9707], 0),
+            PrefillStepItem::new(request_id, vec![151_646, 9707], None),
+            PrefillStepItem::new(request_id, vec![9707], None),
         ];
 
         let err = executor
@@ -3740,7 +3772,7 @@ mod tests {
 
         executor
             .execute_prefill(PrefillPlan {
-                requests: &[PrefillStepItem::new(request_id, vec![151_646, 9707], 0)],
+                requests: &[PrefillStepItem::new(request_id, vec![151_646, 9707], None)],
             })
             .expect("the rejected request ID remains reusable");
         executor

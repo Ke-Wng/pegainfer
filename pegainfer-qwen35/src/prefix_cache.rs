@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use anyhow::Result;
 use pegainfer_core::tensor::DeviceContext;
@@ -44,8 +43,6 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) inserts: u64,
     /// Published snapshots replaced by LRU insertion.
     pub(crate) evictions: u64,
-    /// Successful joint restore time, including lookup, attach, copy, and checks.
-    pub(crate) restore_ns: u64,
 }
 
 /// One recurrent snapshot indexed by a reusable prefix boundary.
@@ -62,8 +59,6 @@ pub(crate) struct SnapshotGuard {
     boundary: usize,
     /// The directory's extra strong references are active restore pins.
     entry: Arc<SnapshotEntry>,
-    /// Start time used for restore latency accounting.
-    started: Instant,
 }
 
 impl SnapshotGuard {
@@ -115,14 +110,13 @@ impl SnapshotCache {
     }
 
     /// Look up `key`, refresh its LRU timestamp, and pin its entry.
-    fn lookup(&mut self, key: PrefixBoundaryKey, started: Instant) -> Option<SnapshotGuard> {
+    fn lookup(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotGuard> {
         let last_used = self.tick();
         let entry = self.entries.get(&key)?;
         entry.last_used.store(last_used, Ordering::Relaxed);
         Some(SnapshotGuard {
             boundary: key.boundary_tokens,
             entry: Arc::clone(entry),
-            started,
         })
     }
 
@@ -306,8 +300,8 @@ impl Qwen35PrefixCache {
     /// Create request-local KV state and select the longest joint prefix.
     ///
     /// If a joint prefix is found, the KV blocks are attached to the request
-    /// and a guard is returned to prevent eviction until the recurrent state
-    /// is copied (see `Qwen35PrefixCache::finish_restore`).
+    /// and a guard is returned to prevent eviction until the recurrent restore
+    /// is enqueued (see `Qwen35PrefixCache::finish_restore`).
     /// If no joint prefix is found, the request is still created and returned.
     pub(crate) fn begin_request(
         &mut self,
@@ -330,7 +324,6 @@ impl Qwen35PrefixCache {
             .probe_prefix(prompt_tokens.to_vec(), lora_name);
         let resident_tokens = probe.reusable_blocks() * self.kv.pool().block_size();
         let mut saw_eligible_kv = false;
-        let started = Instant::now();
         for boundary in eligible_boundaries(resident_tokens, SNAPSHOT_STRIDE_TOKENS) {
             saw_eligible_kv = true;
             let Some(sequence_hash) = probe.boundary_hash(boundary) else {
@@ -340,7 +333,7 @@ impl Qwen35PrefixCache {
                 sequence_hash,
                 boundary_tokens: boundary,
             };
-            let Some(guard) = self.snapshots.lookup(key, started) else {
+            let Some(guard) = self.snapshots.lookup(key) else {
                 self.stats.snapshot_misses += 1;
                 continue;
             };
@@ -368,13 +361,13 @@ impl Qwen35PrefixCache {
         Ok((request, None))
     }
 
-    /// Finish a restore after the caller has copied the recurrent state.
+    /// Finish a restore after the caller has enqueued the recurrent-state copy.
     ///
     /// `begin_request` performs lookup and KV attachment. The physical
     /// recurrent-state copy remains executor-specific: single-GPU execution
-    /// copies from the local store, while TP coordinates all workers. Call this
-    /// method after those copies complete; it validates the positions and
-    /// releases the guard.
+    /// copies from the local store, while TP coordinates all workers. This
+    /// validates the positions and releases the guard once every copy is
+    /// enqueued in stream order.
     pub(crate) fn finish_restore(
         &mut self,
         request: &RequestKv,
@@ -394,11 +387,7 @@ impl Qwen35PrefixCache {
         );
         self.stats.joint_hits += 1;
         self.stats.joint_hit_tokens += boundary as u64;
-        self.stats.restore_ns = self
-            .stats
-            .restore_ns
-            .saturating_add(guard.started.elapsed().as_nanos() as u64);
-        // End the cache pin only after every physical restore was checked.
+        // End the cache pin after restore enqueue and position validation.
         drop(guard);
         Ok(boundary)
     }
@@ -529,8 +518,6 @@ fn eligible_boundaries(resident_tokens: usize, stride: usize) -> impl Iterator<I
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use pegainfer_kv_cache::BlockPool;
 
     use super::PrefixBoundaryKey;
@@ -564,9 +551,9 @@ mod tests {
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
-        assert!(state.lookup(key(1), Instant::now()).is_none());
+        assert!(state.lookup(key(1)).is_none());
         state.publish(reservation);
-        assert!(state.lookup(key(1), Instant::now()).is_some());
+        assert!(state.lookup(key(1)).is_some());
     }
 
     #[test]
@@ -576,7 +563,7 @@ mod tests {
             .reserve(key(1))
             .expect("empty state must reserve a write");
         state.abort(reservation);
-        assert!(state.lookup(key(1), Instant::now()).is_none());
+        assert!(state.lookup(key(1)).is_none());
         assert!(state.reserve(key(2)).is_some());
     }
 
@@ -600,18 +587,14 @@ mod tests {
                 .expect("state should have a free slot");
             state.publish(reservation);
         }
-        drop(
-            state
-                .lookup(key(1), Instant::now())
-                .expect("key 1 should be present"),
-        );
+        drop(state.lookup(key(1)).expect("key 1 should be present"));
         let reservation = state
             .reserve(key(3))
             .expect("an unpinned LRU victim should be available");
         state.publish(reservation);
-        assert!(state.lookup(key(1), Instant::now()).is_some());
-        assert!(state.lookup(key(2), Instant::now()).is_none());
-        assert!(state.lookup(key(3), Instant::now()).is_some());
+        assert!(state.lookup(key(1)).is_some());
+        assert!(state.lookup(key(2)).is_none());
+        assert!(state.lookup(key(3)).is_some());
     }
 
     #[test]
@@ -621,9 +604,7 @@ mod tests {
             .reserve(key(1))
             .expect("empty state must reserve a write");
         state.publish(reservation);
-        let guard = state
-            .lookup(key(1), Instant::now())
-            .expect("key 1 should be present");
+        let guard = state.lookup(key(1)).expect("key 1 should be present");
         assert!(state.reserve(key(2)).is_none());
         drop(guard);
         assert!(state.reserve(key(2)).is_some());
@@ -672,6 +653,6 @@ mod tests {
         cold.revert_schedule().expect("revert cold reservation");
         cold.release().expect("release cold request");
 
-        assert!(state.lookup(key, Instant::now()).is_some());
+        assert!(state.lookup(key).is_some());
     }
 }

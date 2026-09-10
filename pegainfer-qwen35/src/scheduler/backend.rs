@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::logprobs::LogprobSnapshot;
+use crate::tp_executor::TpBeginRequestError;
 
 pub(super) struct SingleGpuBackend {
     pub(super) model: Qwen35Model,
@@ -98,6 +99,20 @@ pub(super) struct TpSchedulerBackend {
     /// Slot move derived by the in-flight `take_active_request`; consumed by
     /// the paired `drop_active_state` so the workers apply the same move.
     pub(super) pending_compaction: Option<TpSlotCompaction>,
+}
+
+pub(super) enum AdmissionError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl From<TpBeginRequestError> for AdmissionError {
+    fn from(error: TpBeginRequestError) -> Self {
+        match error {
+            TpBeginRequestError::Recoverable(error) => Self::Recoverable(error),
+            TpBeginRequestError::Fatal(error) => Self::Fatal(error),
+        }
+    }
 }
 
 impl SingleGpuBackend {
@@ -202,14 +217,13 @@ impl SingleGpuBackend {
         let cache = &self.kv_cache;
         let stats = cache.stats();
         info!(
-            "Qwen3.5 prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, restore_ms={:.3}, occupancy={}/{}",
+            "Qwen3.5 prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
             stats.joint_hits,
             stats.joint_hit_tokens,
             stats.kv_only_fallbacks,
             stats.snapshot_misses,
             stats.inserts,
             stats.evictions,
-            stats.restore_ns as f64 / 1_000_000.0,
             cache.snapshot_occupancy(),
             cache.snapshot_slots(),
         );
@@ -288,14 +302,19 @@ impl SingleGpuBackend {
     pub(super) fn alloc_prefill_state(
         &mut self,
         req: &SchedulerRequest,
-    ) -> Result<(PrefillBackendState, usize)> {
-        let mut rec = self.alloc_recurrent()?;
-        let (mut kv, restore) = self.kv_cache.begin_request(
-            &req.prompt_tokens,
-            req.max_tokens,
-            req.lora_adapter.as_deref(),
-            !req.echo,
-        )?;
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
+        let mut rec = self
+            .alloc_recurrent()
+            .map_err(AdmissionError::Recoverable)?;
+        let (mut kv, restore) = self
+            .kv_cache
+            .begin_request(
+                &req.prompt_tokens,
+                req.max_tokens,
+                req.lora_adapter.as_deref(),
+                true,
+            )
+            .map_err(AdmissionError::Recoverable)?;
         let cached_tokens = if let Some(restore) = restore {
             if let Err(error) = self.recurrent_store.restore(
                 self.model.device_ctx(),
@@ -303,13 +322,13 @@ impl SingleGpuBackend {
                 &mut rec,
             ) {
                 let _ = self.kv_cache.release_request(&mut kv);
-                return Err(error);
+                return Err(AdmissionError::Recoverable(error));
             }
             match self.kv_cache.finish_restore(&kv, restore, &[rec.seq_len]) {
                 Ok(tokens) => tokens,
                 Err(error) => {
                     let _ = self.kv_cache.release_request(&mut kv);
-                    return Err(error);
+                    return Err(AdmissionError::Recoverable(error));
                 }
             }
         } else {
@@ -585,15 +604,18 @@ impl TpSchedulerBackend {
     pub(super) fn alloc_prefill_state(
         &mut self,
         req: &SchedulerRequest,
-    ) -> Result<(PrefillBackendState, usize)> {
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         let request_id = self.alloc_request_id();
-        let cached_tokens = self.executor.begin_request(
-            request_id,
-            &req.prompt_tokens,
-            req.max_tokens,
-            req.lora_adapter.as_deref(),
-            !req.echo,
-        )?;
+        let cached_tokens = self
+            .executor
+            .begin_request(
+                request_id,
+                &req.prompt_tokens,
+                req.max_tokens,
+                req.lora_adapter.as_deref(),
+                true,
+            )
+            .map_err(AdmissionError::from)?;
         Ok((PrefillBackendState::Tp { request_id }, cached_tokens))
     }
 
@@ -811,7 +833,7 @@ impl SchedulerBackend {
     pub(super) fn alloc_prefill_state(
         &mut self,
         req: &SchedulerRequest,
-    ) -> Result<(PrefillBackendState, usize)> {
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         match self {
             Self::Single(backend) => backend.alloc_prefill_state(req),
             Self::Tp(backend) => backend.alloc_prefill_state(req),
