@@ -61,7 +61,7 @@ impl BatchDecodeGraphState {
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
-        max_total_pages: usize,
+        page_size: usize,
         padding_page_id: i32,
         max_batch: usize,
     ) -> Result<Self> {
@@ -70,7 +70,7 @@ impl BatchDecodeGraphState {
             config,
             geometry,
             max_batch,
-            max_total_pages,
+            page_size,
             padding_page_id,
         )?;
 

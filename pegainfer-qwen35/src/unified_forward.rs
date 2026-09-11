@@ -228,10 +228,7 @@ mod tests {
         let next = greedy_sample_batch(&model, &prefill_logits, 1)[0];
         cache.apply_prefill(&mut kv, Some(next)).unwrap();
         let mut graph_state = model
-            .create_batch_decode_graph_state(
-                cache.pool().total_blocks(),
-                cache.pool().padding_block_id(),
-            )
+            .create_batch_decode_graph_state(cache.pool().padding_block_id())
             .unwrap();
         graph_state
             .copy_state_to_slot(&model.ctx, &rec_states[0], 0)
@@ -279,10 +276,7 @@ mod tests {
         ];
         let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
         let mut gs = model
-            .create_batch_decode_graph_state(
-                cache.pool().total_blocks(),
-                cache.pool().padding_block_id(),
-            )
+            .create_batch_decode_graph_state(cache.pool().padding_block_id())
             .unwrap();
         let first_logits = if unified {
             model

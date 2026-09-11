@@ -538,12 +538,10 @@ impl Qwen35Model {
     /// Create the CUDA Graph batch decode state at the loaded capacity.
     pub(crate) fn create_batch_decode_graph_state(
         &self,
-        max_total_pages: usize,
         padding_page_id: i32,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
         self.create_batch_decode_graph_state_with_capacity(
             self.reserved_decode_slots,
-            max_total_pages,
             padding_page_id,
         )
     }
@@ -551,7 +549,6 @@ impl Qwen35Model {
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
         max_batch: usize,
-        max_total_pages: usize,
         padding_page_id: i32,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
         anyhow::ensure!(
@@ -563,7 +560,7 @@ impl Qwen35Model {
             &self.ctx,
             &self.config,
             self.geometry,
-            max_total_pages,
+            self.kv_buffer.layout().page_size,
             padding_page_id,
             max_batch,
         )
@@ -572,7 +569,6 @@ impl Qwen35Model {
     pub(crate) fn create_batch_decode_buffers_with_capacity(
         &self,
         max_batch: usize,
-        max_total_pages: usize,
         padding_page_id: i32,
     ) -> anyhow::Result<super::decode_buffers::BatchDecodeBuffers35> {
         super::decode_buffers::BatchDecodeBuffers35::new(
@@ -580,7 +576,7 @@ impl Qwen35Model {
             &self.config,
             self.geometry,
             max_batch,
-            max_total_pages,
+            self.kv_buffer.layout().page_size,
             padding_page_id,
         )
     }
