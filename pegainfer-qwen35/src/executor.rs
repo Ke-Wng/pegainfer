@@ -121,10 +121,8 @@ impl Qwen35Executor {
         let manager =
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
         let kv_cache = Qwen35PrefixCache::new(manager, 0)?;
-        let graph_state = model.create_batch_decode_graph_state(
-            kv_cache.pool().total_blocks(),
-            kv_cache.pool().padding_block_id(),
-        )?;
+        let graph_state =
+            model.create_batch_decode_graph_state(kv_cache.pool().padding_block_id())?;
         Ok(Self {
             model,
             kv_cache,

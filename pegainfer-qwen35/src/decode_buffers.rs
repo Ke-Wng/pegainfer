@@ -67,11 +67,15 @@ impl BatchDecodeBuffers35 {
         config: &Config35,
         geometry: LocalGeometry,
         max_batch_size: usize,
-        max_total_pages: usize,
+        page_size: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
+        let max_view_pages = config.max_position_embeddings.div_ceil(page_size).max(1);
+        let page_index_capacity = bs
+            .checked_mul(max_view_pages)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode page-index capacity overflow"))?;
         let q_proj_dim = geometry.local_full_attn_gated_q_dim();
         let q_dim = geometry.local_full_attn_q_dim();
         let kv_dim = geometry.local_full_attn_kv_dim();
@@ -108,8 +112,7 @@ impl BatchDecodeBuffers35 {
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
-            // Extra capacity for padding slots (at most max_batch_size padding entries).
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
+            page_indices_d: ctx.stream.alloc_zeros(page_index_capacity)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
@@ -185,6 +188,12 @@ impl BatchDecodeBuffers35 {
         let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
         let kv_tile_indices = vec![0i32; padded_bs];
 
+        anyhow::ensure!(
+            all_page_indices.len() <= self.page_indices_d.len(),
+            "Qwen3.5 decode page-index overflow: {} view pages exceed buffer capacity {}",
+            all_page_indices.len(),
+            self.page_indices_d.len()
+        );
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
         ctx.stream.memcpy_htod(&indptr, &mut self.page_indptr_d)?;

@@ -1826,11 +1826,8 @@ impl TpWorkerPrepared {
             prefill_scratch_tokens,
             prefill_scratch_bytes as f64 / 1024.0 / 1024.0,
         );
-        let decode_buffers = model.create_batch_decode_buffers_with_capacity(
-            max_batch,
-            model.kv_buffer().num_blocks(),
-            padding_block_id,
-        )?;
+        let decode_buffers =
+            model.create_batch_decode_buffers_with_capacity(max_batch, padding_block_id)?;
         let sample_scratch = pegainfer_sample::SampleScratch::new(
             model.device_ctx(),
             model.config().selection_vocab,
@@ -1894,11 +1891,8 @@ impl TpWorkerPrepared {
             // cuStreamBeginCapture during the pre-capture sweep.
             model.tune_decode_gemm_algos()?;
             let slots = bucket_for(effective_max_batch);
-            let graph_state = model.create_batch_decode_graph_state_with_capacity(
-                slots,
-                model.kv_buffer().num_blocks(),
-                padding_block_id,
-            )?;
+            let graph_state =
+                model.create_batch_decode_graph_state_with_capacity(slots, padding_block_id)?;
             (Some(graph_state), vec![None; slots])
         } else {
             (None, Vec::new())

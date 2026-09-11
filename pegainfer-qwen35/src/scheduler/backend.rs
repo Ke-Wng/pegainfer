@@ -248,7 +248,6 @@ impl SingleGpuBackend {
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
         let graph_state = model.create_batch_decode_graph_state_with_capacity(
             graph_capacity,
-            kv_cache.pool().total_blocks(),
             kv_cache.pool().padding_block_id(),
         )?;
         let prefill_stream = match decode_overlap {

@@ -193,10 +193,7 @@ mod tests {
         ];
         let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
         let mut gs = model
-            .create_batch_decode_graph_state(
-                cache.pool().total_blocks(),
-                cache.pool().padding_block_id(),
-            )
+            .create_batch_decode_graph_state(cache.pool().padding_block_id())
             .unwrap();
         let first_logits = if unified {
             model
