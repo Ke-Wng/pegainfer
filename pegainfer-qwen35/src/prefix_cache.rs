@@ -120,6 +120,10 @@ impl SnapshotCache {
         })
     }
 
+    fn contains(&self, key: PrefixBoundaryKey) -> bool {
+        self.entries.contains_key(&key)
+    }
+
     /// Reserve a free or unpinned LRU slot without publishing the new entry.
     fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
         let last_used = self.tick();
@@ -295,6 +299,33 @@ impl Qwen35PrefixCache {
     /// Return a point-in-time copy of cumulative cache metrics.
     pub(crate) fn stats(&self) -> PrefixCacheStats {
         self.stats
+    }
+
+    /// Return the longest prefix with both active KV and a recurrent snapshot.
+    /// Its KV pages are outside the available pool and may be shared.
+    pub(crate) fn active_joint_prefix_pages(
+        &self,
+        prompt_tokens: &[u32],
+        lora_name: Option<&str>,
+    ) -> usize {
+        if !self.enabled() {
+            return 0;
+        }
+        let hashes = self
+            .kv
+            .pool()
+            .active_prefix_hashes(prompt_tokens.to_vec(), lora_name);
+        let block_size = self.kv.pool().block_size();
+        let resident_tokens = hashes.len() * block_size;
+        eligible_boundaries(resident_tokens, SNAPSHOT_STRIDE_TOKENS)
+            .find(|&boundary| {
+                let key = PrefixBoundaryKey {
+                    sequence_hash: hashes[boundary / block_size - 1],
+                    boundary_tokens: boundary,
+                };
+                self.snapshots.contains(key)
+            })
+            .map_or(0, |boundary| boundary / block_size)
     }
 
     /// Create request-local KV state and select the longest joint prefix.

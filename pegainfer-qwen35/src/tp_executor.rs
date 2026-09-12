@@ -589,6 +589,15 @@ impl Qwen35TpExecutor {
         self.kv_cache.pool().available_blocks()
     }
 
+    pub(crate) fn active_joint_prefix_pages(
+        &self,
+        prompt_tokens: &[u32],
+        lora_name: Option<&str>,
+    ) -> usize {
+        self.kv_cache
+            .active_joint_prefix_pages(prompt_tokens, lora_name)
+    }
+
     pub(crate) fn prefix_cache_enabled(&self) -> bool {
         self.kv_cache.enabled()
     }

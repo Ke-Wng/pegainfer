@@ -266,6 +266,7 @@ fn closed_pending_work_is_pruned_before_admission() {
         128,
         |req| req.prompt_tokens.len(),
         |req| req.max_tokens,
+        |_| 0,
     );
     assert_eq!(admission.pending.len(), 1);
     assert!(admission.deferred.is_empty());
@@ -342,6 +343,7 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
         128,
         |req| req.prompt_tokens.len(),
         |req| req.max_tokens,
+        |_| 0,
     );
 
     assert!(active.is_empty());

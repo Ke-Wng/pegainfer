@@ -290,6 +290,11 @@ impl SingleGpuBackend {
         self.kv_cache.pool().available_blocks()
     }
 
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        self.kv_cache
+            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
+    }
+
     pub(super) fn capacity_pages_for_requests(&self) -> usize {
         self.kv_cache.pool().max_request_blocks()
     }
@@ -618,6 +623,11 @@ impl TpSchedulerBackend {
         Ok((PrefillBackendState::Tp { request_id }, cached_tokens))
     }
 
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        self.executor
+            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
+    }
+
     pub(super) fn new(
         model_path: &str,
         device_ordinals: &[usize],
@@ -775,6 +785,13 @@ impl SchedulerBackend {
         match self {
             Self::Single(backend) => backend.log_prefix_cache_stats(),
             Self::Tp(backend) => backend.executor.log_prefix_cache_stats(),
+        }
+    }
+
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        match self {
+            Self::Single(backend) => backend.active_joint_prefix_pages(req),
+            Self::Tp(backend) => backend.active_joint_prefix_pages(req),
         }
     }
 

@@ -880,89 +880,101 @@ fn scheduler_loop(
             })
             .collect();
         let page_size = backend.page_size();
-        let prefilling_budget: Vec<PrefillKvBudget> = prefilling
-            .iter()
-            .map(|p| PrefillKvBudget {
-                current_tokens: p.cursor,
-                prompt_len: p.req.prompt_tokens.len(),
-                max_tokens: p.req.max_tokens,
-            })
-            .collect();
-        let page_budget = backend
-            .available_pages(&active, &prefilling)
-            .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
-        let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
-        let admission = admit_pending_requests(
-            pending,
-            &active_budget,
-            decode_batching_slot,
-            page_size,
-            page_budget,
-            // KvPool capacity includes the CUDA Graph padding page reserved at
-            // construction, so a real request can use at most the remaining pages.
-            backend.capacity_pages_for_requests(),
-            backend.max_position_embeddings(),
-            |req| req.prompt_tokens.len(),
-            |req| req.max_tokens,
-        );
-        for (rejected, reason) in &admission.rejected {
-            send_rejection(rejected, *reason);
-        }
-
-        // 6. Move freshly admitted prompts into the chunked-prefill queue.
-        let mut admitted = admission.pending.into_iter();
-        while let Some(req) = admitted.next() {
-            debug!(
-                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
-                req.request_id,
-                req.prompt_tokens.len(),
-                req.max_tokens
+        let mut admission_pending = pending;
+        loop {
+            let prefilling_budget: Vec<PrefillKvBudget> = prefilling
+                .iter()
+                .map(|p| PrefillKvBudget {
+                    current_tokens: p.cursor,
+                    prompt_len: p.req.prompt_tokens.len(),
+                    max_tokens: p.req.max_tokens,
+                })
+                .collect();
+            let page_budget = backend
+                .available_pages(&active, &prefilling)
+                .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
+            let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
+            let admission = admit_pending_requests(
+                admission_pending,
+                &active_budget,
+                decode_batching_slot,
+                page_size,
+                page_budget,
+                // KvPool capacity includes the CUDA Graph padding page reserved at
+                // construction, so a real request can use at most the remaining pages.
+                backend.capacity_pages_for_requests(),
+                backend.max_position_embeddings(),
+                |req| req.prompt_tokens.len(),
+                |req| req.max_tokens,
+                |req| backend.active_joint_prefix_pages(req),
             );
-            match backend.alloc_prefill_state(&req) {
-                Ok((backend_state, cached_tokens)) => {
-                    let scheduled_at_unix_s = unix_now_s();
-                    let _ = req.token_tx.send(TokenEvent::Scheduled {
-                        queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at_unix_s),
-                        scheduled_at_unix_s,
-                        prompt_tokens: req.prompt_tokens.len(),
-                        cached_tokens,
-                    });
-                    prefilling.push(PrefillingRequest35 {
-                        backend_state,
-                        cursor: cached_tokens,
-                        step_chunk: 0,
-                        req,
-                    });
-                }
-                Err(AdmissionError::Recoverable(error)) => {
-                    warn!("failed to admit new request: {error}");
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: error.to_string(),
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                }
-                Err(AdmissionError::Fatal(error)) => {
-                    let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
-                    let failure = FatalSchedulerError::new(error.to_string())
-                        .with_request(req)
-                        .with_requests(admitted);
-                    terminal_scheduler_shutdown(
-                        &mut submit_rx,
-                        &load_tx,
-                        kv_total_blocks,
-                        active,
-                        prefilling,
-                        Vec::new(),
-                        admission.deferred,
-                        inflight_prefill.take(),
-                        failure,
-                    );
-                    return;
+            for (rejected, reason) in &admission.rejected {
+                send_rejection(rejected, *reason);
+            }
+
+            // 6. Materialize admitted prompts. A restore can move cached KV out
+            // of the available pool, so re-run admission for FIFO followers.
+            let mut restored_prefix = false;
+            let mut admitted = admission.pending.into_iter();
+            while let Some(req) = admitted.next() {
+                debug!(
+                    "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                    req.request_id,
+                    req.prompt_tokens.len(),
+                    req.max_tokens
+                );
+                match backend.alloc_prefill_state(&req) {
+                    Ok((backend_state, cached_tokens)) => {
+                        restored_prefix |= cached_tokens > 0;
+                        let scheduled_at_unix_s = unix_now_s();
+                        let _ = req.token_tx.send(TokenEvent::Scheduled {
+                            queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at_unix_s),
+                            scheduled_at_unix_s,
+                            prompt_tokens: req.prompt_tokens.len(),
+                            cached_tokens,
+                        });
+                        prefilling.push(PrefillingRequest35 {
+                            backend_state,
+                            cursor: cached_tokens,
+                            step_chunk: 0,
+                            req,
+                        });
+                    }
+                    Err(AdmissionError::Recoverable(error)) => {
+                        warn!("failed to admit new request: {error}");
+                        let _ = req.token_tx.send(TokenEvent::Error {
+                            message: error.to_string(),
+                            prompt_tokens: req.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                    }
+                    Err(AdmissionError::Fatal(error)) => {
+                        let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                        let failure = FatalSchedulerError::new(error.to_string())
+                            .with_request(req)
+                            .with_requests(admitted);
+                        terminal_scheduler_shutdown(
+                            &mut submit_rx,
+                            &load_tx,
+                            kv_total_blocks,
+                            active,
+                            prefilling,
+                            Vec::new(),
+                            admission.deferred,
+                            inflight_prefill.take(),
+                            failure,
+                        );
+                        return;
+                    }
                 }
             }
+
+            if admission.deferred.is_empty() || !restored_prefix {
+                deferred = admission.deferred;
+                break;
+            }
+            admission_pending = admission.deferred;
         }
-        deferred = admission.deferred;
 
         // 7. Choose this tick's prefill budget, take that chunk off the front of
         //    the queue, then dispatch by plan. Auto can return 0 for a short
