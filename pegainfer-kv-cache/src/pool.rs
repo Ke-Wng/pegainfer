@@ -130,6 +130,21 @@ impl BlockPool {
         self.block_manager.evict_inactive();
     }
 
+    /// Return active prompt-prefix hashes without promoting inactive entries or
+    /// keeping the matched blocks alive.
+    pub fn active_prefix_hashes(
+        &self,
+        prompt_tokens: Vec<u32>,
+        lora_name: Option<&str>,
+    ) -> Vec<[u8; 16]> {
+        let num_input = prompt_tokens.len();
+        let request = self.new_request(prompt_tokens, 0, lora_name);
+        let hashes = request.seq.inner().sequence().all_sequence_hashes();
+        let cacheable = num_input.saturating_sub(1) / self.block_size;
+        let active = self.block_manager.active_prefix_len(&hashes).min(cacheable);
+        hashes[..active].iter().map(sequence_hash_bytes).collect()
+    }
+
     /// `lora_name` scopes the prefix cache: blocks registered under one
     /// adapter (or the base model, `None`) never match a request running
     /// under a different adapter — the name is folded into the block-hash
@@ -758,6 +773,19 @@ mod tests {
             ha[0],
             "salt (lora) must scope the prefix cache"
         );
+    }
+
+    #[test]
+    fn active_prefix_hashes_exclude_reclaimable_entries() {
+        let pool = BlockPool::new(16, 8).expect("pool");
+        let prompt = vec![7; 40];
+        let mut request = pool.new_request(prompt.clone(), 0, None);
+        request.schedule_prefill(32, &pool).expect("schedule");
+        request.apply_prefill_chunk(&pool).expect("apply");
+
+        assert_eq!(pool.active_prefix_hashes(prompt.clone(), None).len(), 2);
+        request.release().expect("release");
+        assert!(pool.active_prefix_hashes(prompt, None).is_empty());
     }
 
     #[test]

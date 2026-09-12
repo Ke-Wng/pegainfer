@@ -101,6 +101,7 @@ pub(super) fn admit_pending_requests<T>(
     max_context_tokens: usize,
     mut prompt_len: impl FnMut(&T) -> usize,
     mut max_tokens: impl FnMut(&T) -> usize,
+    mut reusable_pages: impl FnMut(&T) -> usize,
 ) -> AdmissionOutcome<T> {
     assert!(page_size > 0, "Qwen3.5 KV page size must be non-zero");
 
@@ -130,13 +131,20 @@ pub(super) fn admit_pending_requests<T>(
             continue;
         }
 
-        if blocked || admitted.len() >= slot_budget || request_pages > page_budget {
+        if blocked || admitted.len() >= slot_budget {
             blocked = true;
             still_deferred.push(req);
             continue;
         }
 
-        page_budget -= request_pages;
+        let fresh_pages = request_pages.saturating_sub(reusable_pages(&req));
+        if fresh_pages > page_budget {
+            blocked = true;
+            still_deferred.push(req);
+            continue;
+        }
+
+        page_budget -= fresh_pages;
         admitted.push(req);
     }
 
@@ -519,6 +527,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(
@@ -546,6 +555,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
@@ -569,6 +579,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert!(outcome.pending.is_empty());
@@ -592,6 +603,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(
@@ -623,6 +635,7 @@ mod tests {
             32,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
@@ -648,6 +661,7 @@ mod tests {
             32,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert!(outcome.pending.is_empty());
@@ -695,6 +709,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert!(outcome.pending.is_empty());
@@ -718,6 +733,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert!(outcome.pending.is_empty());
@@ -747,6 +763,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
@@ -755,6 +772,27 @@ mod tests {
             vec![2],
             "pending request 1 reserves its future decode KV page"
         );
+        assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn admission_credits_legal_joint_prefix_pages() {
+        // Each request has an 18-page lifetime and shares a 256-token (16-page) prefix.
+        let outcome = admit_pending_requests(
+            vec![pending_with_max(1, 272, 16), pending_with_max(2, 272, 16)],
+            &[],
+            2,
+            16,
+            4,
+            18,
+            usize::MAX,
+            |req| req.prompt_len,
+            |req| req.max_tokens,
+            |_| 16,
+        );
+
+        assert_eq!(ids(&outcome.pending), vec![1, 2]);
+        assert!(outcome.deferred.is_empty());
         assert!(outcome.rejected.is_empty());
     }
 
@@ -802,6 +840,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
@@ -828,6 +867,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![2]);
@@ -851,6 +891,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
@@ -910,6 +951,7 @@ mod tests {
             usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
+            |_| 0,
         );
 
         assert_eq!(ids(&outcome.pending), vec![1]);
