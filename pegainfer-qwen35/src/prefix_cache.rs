@@ -446,16 +446,15 @@ impl Qwen35PrefixCache {
         request: &mut RequestKv,
         first_token: Option<u32>,
     ) -> Result<usize> {
-        let applied = if let Some(first_token) = first_token {
+        if let Some(first_token) = first_token {
             request.apply_prefill(first_token, self.kv.pool())
         } else {
             request.apply_prefill_chunk(self.kv.pool())
-        };
+        }?;
         // Retain registered KV only when prefix caching is enabled.
         if !self.enabled() {
             request.mark_blocks_reset_on_release();
         }
-        applied?;
         let boundary = request.kv_position();
         Ok(boundary)
     }
@@ -518,11 +517,10 @@ impl Qwen35PrefixCache {
 
     /// Apply the KV written by decode and record the newly sampled token.
     pub(crate) fn apply_decode(&self, request: &mut RequestKv, token: u32) -> Result<()> {
-        let applied = request.apply_decode(token, self.kv.pool());
+        request.apply_decode(token, self.kv.pool())?;
         if !self.enabled() {
             request.mark_blocks_reset_on_release();
         }
-        applied?;
         Ok(())
     }
 
