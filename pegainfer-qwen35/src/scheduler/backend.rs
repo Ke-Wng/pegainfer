@@ -217,7 +217,7 @@ impl SingleGpuBackend {
         let cache = &self.kv_cache;
         let stats = cache.stats();
         info!(
-            "Qwen3.5 prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
             stats.joint_hits,
             stats.joint_hit_tokens,
             stats.kv_only_fallbacks,

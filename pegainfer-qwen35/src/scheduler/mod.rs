@@ -1999,7 +1999,7 @@ fn revert_scheduled_requests<'a>(
 ) {
     for request in requests {
         if let Err(error) = kv_cache.revert_schedule(request) {
-            warn!("failed to revert Qwen3.5 scheduler KV schedule: {error}");
+            warn!("failed to revert KV schedule: {error}");
         }
     }
 }

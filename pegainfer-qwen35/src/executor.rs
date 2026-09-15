@@ -408,7 +408,7 @@ fn revert_scheduled_requests<'a>(
 ) {
     for request in requests {
         if let Err(error) = kv_cache.revert_schedule(request) {
-            log::warn!("failed to revert Qwen3.5 executor KV schedule: {error}");
+            log::warn!("failed to revert KV schedule: {error}");
         }
     }
 }
