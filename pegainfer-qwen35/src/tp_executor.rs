@@ -461,7 +461,7 @@ impl Qwen35TpExecutor {
             if let Some(request) = self.request_kvs.get_mut(request_id) {
                 if let Err(error) = self.kv_cache.revert_schedule(request) {
                     log::warn!(
-                        "failed to revert Qwen3.5 TP request {} KV schedule: {error}",
+                        "failed to revert request {} KV schedule: {error}",
                         request_id.get()
                     );
                 }
@@ -605,7 +605,7 @@ impl Qwen35TpExecutor {
     pub(crate) fn log_prefix_cache_stats(&self) {
         let stats = self.kv_cache.stats();
         log::info!(
-            "Qwen3.5 TP prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
             self.world_size,
             stats.joint_hits,
             stats.joint_hit_tokens,
