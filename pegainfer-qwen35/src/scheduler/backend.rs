@@ -677,11 +677,7 @@ impl TpSchedulerBackend {
         self.executor.is_stop_token(token)
     }
 
-    pub(super) fn available_pages(
-        &self,
-        _active: &[ActiveRequest35],
-        _prefilling: &[PrefillingRequest35],
-    ) -> usize {
+    pub(super) fn available_pages(&self) -> usize {
         self.executor.available_pages()
     }
 
@@ -821,14 +817,10 @@ impl SchedulerBackend {
         }
     }
 
-    pub(super) fn available_pages(
-        &self,
-        active: &[ActiveRequest35],
-        prefilling: &[PrefillingRequest35],
-    ) -> usize {
+    pub(super) fn available_pages(&self) -> usize {
         match self {
             Self::Single(backend) => backend.available_pages(),
-            Self::Tp(backend) => backend.available_pages(active, prefilling),
+            Self::Tp(backend) => backend.available_pages(),
         }
     }
 

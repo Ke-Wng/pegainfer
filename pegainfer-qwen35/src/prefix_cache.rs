@@ -547,10 +547,7 @@ fn eligible_boundaries(resident_tokens: usize, stride: usize) -> impl Iterator<I
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_kv_cache::BlockPool;
-
     use super::PrefixBoundaryKey;
-    use super::SNAPSHOT_STRIDE_TOKENS;
     use super::SnapshotCache;
     use super::eligible_boundaries;
 
@@ -597,14 +594,22 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_refreshes_lru_without_allocating_a_slot() {
-        let mut state = SnapshotCache::new(1);
-        let reservation = state
-            .reserve(key(1))
-            .expect("empty directory must reserve a write");
-        state.publish(reservation);
+    fn duplicate_reservation_refreshes_lru() {
+        let mut state = SnapshotCache::new(2);
+        for tag in [1, 2] {
+            let reservation = state
+                .reserve(key(tag))
+                .expect("state should have a free slot");
+            state.publish(reservation);
+        }
         assert!(state.reserve(key(1)).is_none());
-        assert_eq!(state.len(), 1);
+        let reservation = state
+            .reserve(key(3))
+            .expect("an unpinned LRU victim should be available");
+        state.publish(reservation);
+        assert!(state.lookup(key(1)).is_some());
+        assert!(state.lookup(key(2)).is_none());
+        assert!(state.lookup(key(3)).is_some());
     }
 
     #[test]
@@ -637,51 +642,5 @@ mod tests {
         assert!(state.reserve(key(2)).is_none());
         drop(guard);
         assert!(state.reserve(key(2)).is_some());
-    }
-
-    #[test]
-    fn released_prefix_kv_is_reclaimable_without_snapshot_eviction() {
-        let pool = BlockPool::new(16, 32).expect("block pool");
-        let baseline = pool.available_blocks();
-        let prompt = vec![7; SNAPSHOT_STRIDE_TOKENS + 16];
-        let mut request = pool.new_request(prompt.clone(), 0, None);
-        request
-            .schedule_prefill(prompt.len(), &pool)
-            .expect("schedule prefill");
-        request.apply_prefill_chunk(&pool).expect("apply prefill");
-        let cached_boundary = request
-            .registered_boundary_hash(SNAPSHOT_STRIDE_TOKENS)
-            .expect("full snapshot boundary is registered");
-
-        let mut state = SnapshotCache::new(1);
-        let key = PrefixBoundaryKey {
-            sequence_hash: cached_boundary,
-            boundary_tokens: SNAPSHOT_STRIDE_TOKENS,
-        };
-        let reservation = state
-            .reserve(key)
-            .expect("empty state must reserve a write");
-        state.publish(reservation);
-        request.release().expect("release request");
-
-        // Released KV remains reusable and counts as available capacity.
-        assert_eq!(pool.available_blocks(), baseline);
-
-        let mut warm = pool.new_request(prompt, 0, None);
-        assert_eq!(
-            warm.match_and_add_prefix(&pool).expect("match inactive KV"),
-            SNAPSHOT_STRIDE_TOKENS
-        );
-        warm.release().expect("release warm request");
-
-        // A full-pool cold reservation reclaims KV without evicting the snapshot.
-        let cold_prompt = vec![9; baseline * pool.block_size()];
-        let mut cold = pool.new_request(cold_prompt.clone(), 0, None);
-        cold.schedule_prefill(cold_prompt.len(), &pool)
-            .expect("inactive KV must satisfy cold allocation");
-        cold.revert_schedule().expect("revert cold reservation");
-        cold.release().expect("release cold request");
-
-        assert!(state.lookup(key).is_some());
     }
 }

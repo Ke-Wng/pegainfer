@@ -538,8 +538,7 @@ fn publish_load(
     let (num_running_reqs, num_waiting_reqs) =
         logical_load_counts(active, prefilling, inflight_prefill_reqs, num_waiting_reqs);
     load_tx.send_replace(SchedulerMetrics {
-        kv_used_blocks: kv_total_blocks
-            .saturating_sub(backend.available_pages(active, prefilling) as u64),
+        kv_used_blocks: kv_total_blocks.saturating_sub(backend.available_pages() as u64),
         kv_total_blocks,
         num_running_reqs,
         num_waiting_reqs,
@@ -891,7 +890,7 @@ fn scheduler_loop(
                 })
                 .collect();
             let page_budget = backend
-                .available_pages(&active, &prefilling)
+                .available_pages()
                 .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
             let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
             let admission = admit_pending_requests(

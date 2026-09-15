@@ -2197,16 +2197,6 @@ impl TpWorkerState {
             chunks.len() == kv_views.len(),
             "TP prefill view count mismatch"
         );
-        let new_requests = chunks
-            .iter()
-            .filter(|chunk| self.request_index(chunk.request_id).is_none())
-            .count();
-        anyhow::ensure!(
-            self.requests.len() + new_requests <= self.max_batch,
-            "Qwen3.5 TP prefill chunks would exceed worker capacity {}",
-            self.max_batch
-        );
-
         let mut primary_results = Vec::new();
         let mut final_row_idx = 0usize;
         for (row_idx, chunk) in chunks.iter().enumerate() {
@@ -2861,7 +2851,7 @@ fn validate_unified_plan(plan: &TpUnifiedPlan, max_batch: usize) -> Result<()> {
 }
 
 fn validate_unified_worker_state(state: &TpWorkerState, plan: &TpUnifiedPlan) -> Result<()> {
-    validate_unified_worker_layout(plan, state.max_batch, state.requests.len(), |request_id| {
+    validate_unified_worker_layout(plan, state.max_batch, |request_id| {
         state
             .request_index(request_id)
             .map(|idx| state.requests[idx].phase)
@@ -2871,30 +2861,22 @@ fn validate_unified_worker_state(state: &TpWorkerState, plan: &TpUnifiedPlan) ->
 fn validate_unified_worker_layout(
     plan: &TpUnifiedPlan,
     max_batch: usize,
-    resident_count: usize,
     mut phase_for: impl FnMut(RequestId) -> Option<TpRequestPhase>,
 ) -> Result<()> {
     validate_unified_plan(plan, max_batch)?;
 
-    let new_prefill_count = plan
-        .prefill
-        .iter()
-        .filter(|item| phase_for(item.request_id).is_none())
-        .count();
-    anyhow::ensure!(
-        resident_count.saturating_add(new_prefill_count) <= max_batch,
-        "Qwen3.5 TP unified plan would exceed worker capacity {}",
-        max_batch
-    );
-
     for item in &plan.prefill {
-        if let Some(phase) = phase_for(item.request_id) {
-            anyhow::ensure!(
-                phase == TpRequestPhase::Prefilling,
-                "Qwen3.5 TP unified prefill request {} is already in decode state",
+        let phase = phase_for(item.request_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 TP unified prefill request {} has no worker state",
                 item.request_id.get()
-            );
-        }
+            )
+        })?;
+        anyhow::ensure!(
+            phase == TpRequestPhase::Prefilling,
+            "Qwen3.5 TP unified prefill request {} is already in decode state",
+            item.request_id.get()
+        );
     }
     for item in &plan.decode {
         let phase = phase_for(item.request_id).ok_or_else(|| {
@@ -3612,6 +3594,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_unified_worker_request_phases() {
+        let prefill_id = RequestId::new(1);
+        let decode_id = RequestId::new(2);
+        let plan = TpUnifiedPlan {
+            prefill: vec![TpPrefillChunkItem::new(
+                prefill_id,
+                vec![151_646],
+                None,
+                false,
+            )],
+            decode: vec![TpDecodeStepItem::new(
+                decode_id,
+                9707,
+                None,
+                SamplingParams::default(),
+            )],
+            prefill_sample_seed: 1,
+            decode_sample_seed: 2,
+        };
+
+        validate_unified_worker_layout(&plan, 2, |id| {
+            (id == prefill_id)
+                .then_some(TpRequestPhase::Prefilling)
+                .or_else(|| (id == decode_id).then_some(TpRequestPhase::Decoding))
+        })
+        .expect("unified rows should reference restored worker state");
+
+        let err = validate_unified_worker_layout(&plan, 2, |id| {
+            (id == decode_id).then_some(TpRequestPhase::Decoding)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("prefill request 1 has no worker state"));
     }
 
     fn assert_workers_empty(executor: &Qwen35TpExecutor) {

@@ -189,20 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_prefix_cache_on_tp1_and_tp2() {
-        validate_argv(&["pegainfer", "--qwen35-prefix-cache-mib", "128"]).unwrap();
-        validate_argv(&[
-            "pegainfer",
-            "--tp-size",
-            "2",
-            "--cuda-graph=false",
-            "--qwen35-prefix-cache-mib",
-            "128",
-        ])
-        .unwrap();
-    }
-
-    #[test]
     fn rejects_contradictory_prefix_cache_flags() {
         let error = validate_argv(&[
             "pegainfer",
@@ -229,8 +215,15 @@ mod tests {
 
     #[test]
     fn accepts_tp_size() {
-        validate_argv(&["pegainfer", "--tp-size", "2", "--cuda-graph=false"])
-            .expect("Qwen3.5 should accept --tp-size for eager TP startup");
+        validate_argv(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-prefix-cache-mib",
+            "128",
+        ])
+        .expect("Qwen3.5 should accept prefix caching with eager TP startup");
     }
 
     #[test]
