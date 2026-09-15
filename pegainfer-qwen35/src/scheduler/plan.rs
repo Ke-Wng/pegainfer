@@ -46,6 +46,7 @@ pub(super) struct SlotCompaction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RejectReason {
+    ZeroMaxTokens,
     ContextLength { limit: usize },
     KvBudget,
 }
@@ -115,6 +116,10 @@ pub(super) fn admit_pending_requests<T>(
     for req in pending {
         let prompt_len = prompt_len(&req);
         let max_tokens = max_tokens(&req);
+        if max_tokens == 0 {
+            rejected.push((req, RejectReason::ZeroMaxTokens));
+            continue;
+        }
         if prompt_len.saturating_add(max_tokens) > max_context_tokens {
             rejected.push((
                 req,
@@ -620,12 +625,13 @@ mod tests {
     }
 
     #[test]
-    fn admission_rejects_requests_past_context_window() {
+    fn admission_rejects_invalid_requests() {
         let outcome = admit_pending_requests(
             vec![
                 pending_with_max(1, 16, 16), // 32 context tokens: admitted.
                 pending_with_max(2, 16, 17), // 33 context tokens: rejected.
                 pending_with_max(3, 40, 1),  // prompt alone exceeds the window.
+                pending_with_max(4, 16, 0),  // no output token requested.
             ],
             &[],
             8,
@@ -640,13 +646,14 @@ mod tests {
 
         assert_eq!(ids(&outcome.pending), vec![1]);
         assert!(outcome.deferred.is_empty());
-        assert_eq!(rejected_ids(&outcome.rejected), vec![2, 3]);
-        for (_, reason) in &outcome.rejected {
+        assert_eq!(rejected_ids(&outcome.rejected), vec![2, 3, 4]);
+        for (_, reason) in &outcome.rejected[..2] {
             assert!(
                 matches!(reason, RejectReason::ContextLength { limit: 32 }),
                 "over-window requests must be rejected on context length"
             );
         }
+        assert!(matches!(outcome.rejected[2].1, RejectReason::ZeroMaxTokens));
     }
 
     #[test]

@@ -1077,6 +1077,7 @@ fn scheduler_loop(
 
 fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
     let message = match reason {
+        RejectReason::ZeroMaxTokens => "max_tokens must be greater than zero".to_owned(),
         RejectReason::ContextLength { limit } => format!(
             "request exceeds this model's maximum context length of {limit} tokens: requested {} (prompt={} + max_tokens={})",
             req.prompt_tokens.len().saturating_add(req.max_tokens),
