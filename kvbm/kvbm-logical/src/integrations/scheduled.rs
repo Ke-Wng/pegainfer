@@ -1631,7 +1631,7 @@ mod tests {
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
         assert_eq!(seq.unassigned_blocks(), 1);
 
-        // The next step uses the held block for pending KV and allocates a new tail.
+        // Next schedule_decode should allocate 1 gen block
         seq.schedule_decode(&manager).unwrap();
         assert_eq!(
             seq.state(),
@@ -1813,8 +1813,7 @@ mod tests {
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, assigned=1, unassigned=0
 
-        // Decode until boundary at total=8. The crossed block remains
-        // unassigned until the next forward computes its final KV entry.
+        // Decode until boundary at total=8
         for _ in 0..3 {
             seq.schedule_decode(&manager).unwrap();
             seq.apply_decode(100, &manager).unwrap();

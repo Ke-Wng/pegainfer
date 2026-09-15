@@ -140,12 +140,20 @@ impl Qwen35Executor {
             self.active.len() + plan.requests.len() <= self.graph_state.slot_states.len(),
             "Qwen3.5 prefill would exceed logits executor capacity"
         );
+        let max_position_embeddings = self.model.config().max_position_embeddings;
         let mut seen = HashSet::with_capacity(plan.requests.len());
         for req in plan.requests {
             anyhow::ensure!(
                 !req.prompt_tokens.is_empty(),
                 "Qwen3.5 logits executor prefill request {} has an empty prompt",
                 req.request_id.get()
+            );
+            anyhow::ensure!(
+                req.prompt_tokens.len() < max_position_embeddings,
+                "Qwen3.5 logits executor prefill request {} with {} prompt tokens leaves no room in the {}-token context window",
+                req.request_id.get(),
+                req.prompt_tokens.len(),
+                max_position_embeddings
             );
             anyhow::ensure!(
                 seen.insert(req.request_id),
@@ -173,10 +181,7 @@ impl Qwen35Executor {
             .map(|req| {
                 self.kv_cache.pool().new_request(
                     req.prompt_tokens.clone(),
-                    self.model
-                        .config()
-                        .max_position_embeddings
-                        .saturating_sub(req.prompt_tokens.len()),
+                    max_position_embeddings - req.prompt_tokens.len(),
                     None,
                 )
             })
