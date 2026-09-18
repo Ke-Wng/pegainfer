@@ -192,7 +192,7 @@ fn joint_restore_and_unpinned_lru_eviction_preserve_output() {
         return;
     }
     let model_path = QWEN35_4B_MODEL_PATH;
-    let tokenizer = common::load_tokenizer(&model_path);
+    let tokenizer = common::load_tokenizer(model_path);
     let prompt_a = prompt_tokens(
         &tokenizer,
         "Alpha prefix exercises full-attention KV plus every recurrent and convolution state. ",
