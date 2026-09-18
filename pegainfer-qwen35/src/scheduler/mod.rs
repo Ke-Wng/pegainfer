@@ -1993,16 +1993,6 @@ fn active_request_kv(request: &mut ActiveRequest35) -> Option<&mut RequestKv> {
         ActiveBackendState::Tp { .. } => None,
     }
 }
-fn revert_scheduled_requests<'a>(
-    kv_cache: &Qwen35PrefixCache,
-    requests: impl IntoIterator<Item = &'a mut RequestKv>,
-) {
-    for request in requests {
-        if let Err(error) = kv_cache.revert_schedule(request) {
-            warn!("failed to revert KV schedule: {error}");
-        }
-    }
-}
 fn unix_now_s() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

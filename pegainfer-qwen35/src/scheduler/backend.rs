@@ -124,10 +124,8 @@ impl SingleGpuBackend {
         debug_assert_eq!(kvs.len(), windows.len());
         for (scheduled, (kv, window)) in kvs.iter_mut().zip(windows).enumerate() {
             if let Err(error) = self.kv_cache.schedule_prefill(kv, window.len()) {
-                revert_scheduled_requests(
-                    &self.kv_cache,
-                    kvs.iter_mut().take(scheduled).map(Box::as_mut),
-                );
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().take(scheduled).map(Box::as_mut));
                 return Err(error);
             }
         }
@@ -144,8 +142,7 @@ impl SingleGpuBackend {
                 panic!("single-GPU decode received TP active state")
             };
             if let Err(error) = self.kv_cache.schedule_decode(kv) {
-                revert_scheduled_requests(
-                    &self.kv_cache,
+                self.kv_cache.revert_scheduled_requests(
                     active
                         .iter_mut()
                         .take(scheduled)
@@ -369,7 +366,8 @@ impl SingleGpuBackend {
             self.kv_cache.buffer(),
         );
         if result.is_err() {
-            revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+            self.kv_cache
+                .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
         }
         result
     }
@@ -413,7 +411,8 @@ impl SingleGpuBackend {
                         "Qwen3.5 async prefill failed ({err}); stream drain failed: {sync_err}"
                     ));
                 }
-                revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
                 return Err(err);
             }
         };
@@ -451,7 +450,8 @@ impl SingleGpuBackend {
         let decode_views = match self.schedule_decode_views(active) {
             Ok(views) => views,
             Err(error) => {
-                revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
                 return Err(error);
             }
         };
@@ -465,11 +465,10 @@ impl SingleGpuBackend {
             &mut self.graph_state,
         );
         if result.is_err() {
-            revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
-            revert_scheduled_requests(
-                &self.kv_cache,
-                active.iter_mut().filter_map(active_request_kv),
-            );
+            self.kv_cache
+                .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
+            self.kv_cache
+                .revert_scheduled_requests(active.iter_mut().filter_map(active_request_kv));
         }
         result
     }
@@ -485,10 +484,8 @@ impl SingleGpuBackend {
             crate::batch_decode::DecodeGraphUse::Serve,
         );
         if result.is_err() {
-            revert_scheduled_requests(
-                &self.kv_cache,
-                active.iter_mut().filter_map(active_request_kv),
-            );
+            self.kv_cache
+                .revert_scheduled_requests(active.iter_mut().filter_map(active_request_kv));
         }
         result
     }
@@ -779,8 +776,11 @@ impl TpSchedulerBackend {
 impl SchedulerBackend {
     pub(super) fn log_prefix_cache_stats(&self) {
         match self {
-            Self::Single(backend) => backend.log_prefix_cache_stats(),
-            Self::Tp(backend) => backend.executor.log_prefix_cache_stats(),
+            Self::Single(backend) if backend.kv_cache.enabled() => backend.log_prefix_cache_stats(),
+            Self::Tp(backend) if backend.executor.prefix_cache_enabled() => {
+                backend.executor.log_prefix_cache_stats();
+            }
+            _ => {}
         }
     }
 

@@ -331,16 +331,9 @@ impl Qwen35Model {
             )?)
         };
 
-        let cache_layout = kv_buffer.layout();
-        let layout = KvLayout::new(
-            cache_layout.num_layers,
-            cache_layout.num_kv_heads,
-            cache_layout.head_dim,
-            cache_layout.page_size,
-        )?;
         self.batch_decode_kernels_graph(
             kv_buffer.buffer(),
-            &layout,
+            &self.decode_kv_layout,
             bs,
             prefill_attn_plan.as_ref(),
             &linear_pointer_tables.state_ptrs,
@@ -464,13 +457,6 @@ impl Qwen35Model {
             .buffers
             .sync_paged_views(&self.ctx, views, padded_bs)?;
 
-        let cache_layout = kv_buffer.layout();
-        let layout = KvLayout::new(
-            cache_layout.num_layers,
-            cache_layout.num_kv_heads,
-            cache_layout.head_dim,
-            cache_layout.page_size,
-        )?;
         let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
 
         // Take graphs out of graph_state to avoid split-borrow in the closure.
@@ -481,7 +467,7 @@ impl Qwen35Model {
             DecodeGraphUse::Serve => graphs[bucket_idx].run_or_capture(&self.ctx, || {
                 self.batch_decode_kernels_graph(
                     kv_buffer.buffer(),
-                    &layout,
+                    &self.decode_kv_layout,
                     padded_bs,
                     None,
                     linear_state_ptrs,
@@ -492,7 +478,7 @@ impl Qwen35Model {
             DecodeGraphUse::CaptureOnly => graphs[bucket_idx].capture_only(&self.ctx, || {
                 self.batch_decode_kernels_graph(
                     kv_buffer.buffer(),
-                    &layout,
+                    &self.decode_kv_layout,
                     padded_bs,
                     None,
                     linear_state_ptrs,
@@ -556,25 +542,18 @@ impl Qwen35Model {
             "hybrid decode",
         )?;
 
-        let cache_layout = kv_buffer.layout();
-        let layout = KvLayout::new(
-            cache_layout.num_layers,
-            cache_layout.num_kv_heads,
-            cache_layout.head_dim,
-            cache_layout.page_size,
-        )?;
         anyhow::ensure!(
-            layout.num_kv_heads == self.geometry.local_num_key_value_heads()
-                && layout.head_dim == self.config.head_dim,
+            self.decode_kv_layout.num_kv_heads == self.geometry.local_num_key_value_heads()
+                && self.decode_kv_layout.head_dim == self.config.head_dim,
             "hybrid decode KV layout mismatch bs={bs}: layout kv_heads={}, head_dim={}; local kv_heads={}, config head_dim={}",
-            layout.num_kv_heads,
-            layout.head_dim,
+            self.decode_kv_layout.num_kv_heads,
+            self.decode_kv_layout.head_dim,
             self.geometry.local_num_key_value_heads(),
             self.config.head_dim
         );
         self.batch_decode_batched_hybrid_kernels(
             kv_buffer.buffer(),
-            &layout,
+            &self.decode_kv_layout,
             &plan,
             bs,
             &graph_state.linear_pointer_tables.state_ptrs,

@@ -530,6 +530,18 @@ impl Qwen35PrefixCache {
         request.revert_schedule()
     }
 
+    /// Best-effort rollback for every request scheduled by one failed step.
+    pub(crate) fn revert_scheduled_requests<'a>(
+        &self,
+        requests: impl IntoIterator<Item = &'a mut RequestKv>,
+    ) {
+        for request in requests {
+            if let Err(error) = self.revert_schedule(request) {
+                log::warn!("failed to revert KV schedule: {error}");
+            }
+        }
+    }
+
     /// Release all request KV.
     pub(crate) fn release_request(&self, request: &mut RequestKv) -> Result<()> {
         if !self.enabled() {

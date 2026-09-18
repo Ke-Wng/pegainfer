@@ -191,7 +191,8 @@ impl Qwen35Executor {
                 &mut kv_states[scheduled],
                 plan.requests[scheduled].prompt_tokens.len(),
             ) {
-                revert_scheduled_requests(&self.kv_cache, kv_states.iter_mut().take(scheduled));
+                self.kv_cache
+                    .revert_scheduled_requests(kv_states.iter_mut().take(scheduled));
                 return Err(error);
             }
         }
@@ -220,7 +221,7 @@ impl Qwen35Executor {
         ) {
             Ok(logits) => logits,
             Err(error) => {
-                revert_scheduled_requests(&self.kv_cache, &mut kv_states);
+                self.kv_cache.revert_scheduled_requests(&mut kv_states);
                 return Err(error);
             }
         };
@@ -282,8 +283,7 @@ impl Qwen35Executor {
                 .kv_cache
                 .schedule_decode(&mut self.active[scheduled].kv)
             {
-                revert_scheduled_requests(
-                    &self.kv_cache,
+                self.kv_cache.revert_scheduled_requests(
                     self.active
                         .iter_mut()
                         .take(scheduled)
@@ -304,10 +304,8 @@ impl Qwen35Executor {
             &mut self.graph_state,
             crate::batch_decode::DecodeGraphUse::Serve,
         ) {
-            revert_scheduled_requests(
-                &self.kv_cache,
-                self.active.iter_mut().map(|active| &mut active.kv),
-            );
+            self.kv_cache
+                .revert_scheduled_requests(self.active.iter_mut().map(|active| &mut active.kv));
             return Err(error);
         }
 
@@ -398,18 +396,6 @@ impl Qwen35Executor {
             self.active[idx].graph_slot_idx = idx;
         }
         release_result
-    }
-}
-
-/// Roll back a set of requests scheduled by the current executor step.
-fn revert_scheduled_requests<'a>(
-    kv_cache: &Qwen35PrefixCache,
-    requests: impl IntoIterator<Item = &'a mut RequestKv>,
-) {
-    for request in requests {
-        if let Err(error) = kv_cache.revert_schedule(request) {
-            log::warn!("failed to revert KV schedule: {error}");
-        }
     }
 }
 

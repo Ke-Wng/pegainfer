@@ -7,6 +7,7 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
 use log::info;
+use pegainfer_core::kv_pool::KvLayout as DecodeKvLayout;
 use pegainfer_core::ops::gemm_rows_into_checked;
 use pegainfer_core::ops::suppress_logits_bf16_in_place;
 use pegainfer_core::rope::RopeTableSpec;
@@ -64,6 +65,8 @@ pub struct Qwen35Model {
     // Partial RoPE cache: [max_seq_len * rotary_dim]
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
+    /// Kernel-facing view of the immutable KV geometry.
+    pub(super) decode_kv_layout: DecodeKvLayout,
     /// Rank-local physical full-attention KV storage.
     kv_buffer: KvBuffer,
     /// Complete recurrent snapshot slots reserved by the load-time budget.
@@ -276,6 +279,12 @@ impl Qwen35Model {
             config.head_dim,
             page_size,
         );
+        let decode_kv_layout = DecodeKvLayout::new(
+            layout.num_layers,
+            layout.num_kv_heads,
+            layout.head_dim,
+            layout.page_size,
+        )?;
         let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
@@ -361,6 +370,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             kv_buffer,
+            decode_kv_layout,
             prefix_snapshot_slots: snapshot_slots,
             reserved_decode_slots: max_batch,
             decode_admission_batch,

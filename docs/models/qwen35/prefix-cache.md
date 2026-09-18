@@ -285,11 +285,24 @@ The implementation acceptance surface should include:
 
 The cold/warm measurements below guide future stride changes. They must not be replaced by the old RTX 4090 CPU-transfer estimates, which measured a deferred design and a different snapshot shape.
 
-## Performance Result (2026-08-06)
+## Performance results
+
+### Cold first-request cost (2026-09-18)
+
+One TP1 first-request run on GPU 1 (RTX 4090) used a fresh engine, a 4,160-token prompt, one output token, CUDA Graphs, and the default 1,024-token prefill budget. Enabling a 128 MiB cache kept the request cold (`joint_hits=0`) but split prefill at every 256-token snapshot boundary and published 16 snapshots.
+
+| Snapshot budget | First-request TTFT |
+| ---: | ---: |
+| 0 MiB | 354.22 ms |
+| 128 MiB | 438.05 ms |
+
+This one-shot comparison is not a distribution, but the measured `+83.83 ms` (`+23.7%`) is material: enabling the cache trades cold TTFT for lower TTFT when later requests reuse a prefix.
+
+### Warm reuse (2026-08-06)
 
 - **Environment:** local Qwen3.5-4B, RTX 4090s only (GPU 1 for TP1; GPUs 1/2 for TP2). TP1 used CUDA Graphs; TP2 used `--cuda-graph=false`.
 
-Qwen3.5 reuses the largest 256-token boundary strictly below the prompt length. This table compares cold and warm TTFT p50 for single-token generation (`cache off -> cache on`).
+Qwen3.5 reuses the largest 256-token boundary strictly below the prompt length. This table compares cache-off cold TTFT with cache-on warm TTFT p50 for single-token generation.
 
 | Prompt tokens | Cached tokens | TP1 | TP1 reduction | TP2 | TP2 reduction |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -318,6 +331,7 @@ This table summarizes behavior under concurrency, mixed load, and decode batchin
 **Conclusion**
 
 - **Core performance gains**
+  - Prefix caching is an explicit cold/warm trade: the one-shot 4,160-token cold request above was 23.7% slower with the cache enabled.
   - Warm TTFT improves with prefix length: at 4,160 prompt tokens it falls by 94.3% on TP1 and 95.1% on TP2.
   - For 128-token outputs, the same long prompt reduces E2E latency by 15.4% on TP1 and 21.1% on TP2; steady decode TPOT is effectively unchanged.
   - The benefit remains under TP1 concurrency and mixed load; warm injections hit 3,840 tokens with 41--51 ms prefill and no warnings.
