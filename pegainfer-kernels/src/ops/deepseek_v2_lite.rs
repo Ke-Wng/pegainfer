@@ -187,18 +187,7 @@ pub struct Dsv2LiteAttentionConfig {
     pub kv_lora_rank: usize,
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub rope_scaling: Option<Dsv2LiteRopeScalingConfig>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Dsv2LiteRopeScalingConfig {
-    pub factor: f32,
-    pub mscale: f32,
-    pub mscale_all_dim: f32,
-    pub beta_fast: f32,
-    pub beta_slow: f32,
-    pub original_max_position_embeddings: usize,
+    pub softmax_scale: f32,
 }
 
 pub fn dsv2_lite_router_softmax_topk_into(
@@ -410,6 +399,7 @@ pub fn dsv2_lite_decode_attention_into(
     slot_ids: &CudaSlice<i32>,
     positions: &CudaSlice<i32>,
     num_slots: usize,
+    rope_cos_sin: &CudaSlice<bf16>,
     key_cache: &mut CudaSlice<bf16>,
     value_cache: &mut CudaSlice<bf16>,
     out: &mut HiddenStates,
@@ -487,6 +477,16 @@ pub fn dsv2_lite_decode_attention_into(
         "DSV2-Lite attention value cache too small: have {}, need {value_elems}",
         value_cache.len()
     );
+    let rope_elems = checked_len(
+        "attention rope table",
+        cfg.max_seq_len,
+        cfg.qk_rope_head_dim,
+    )?;
+    ensure!(
+        rope_cos_sin.len() >= rope_elems,
+        "DSV2-Lite attention rope table too small: have {}, need {rope_elems}",
+        rope_cos_sin.len()
+    );
     ensure_hidden_backing_len("attention q", q.data.len(), q.hidden_dim, q.seq_len)?;
     ensure_hidden_backing_len(
         "attention kv_a",
@@ -502,27 +502,6 @@ pub fn dsv2_lite_decode_attention_into(
     )?;
     ensure_hidden_backing_len("attention out", out.data.len(), out.hidden_dim, out.seq_len)?;
 
-    let (
-        rope_factor,
-        rope_mscale,
-        rope_mscale_all_dim,
-        rope_beta_fast,
-        rope_beta_slow,
-        rope_original,
-        has_rope_scaling,
-    ) = cfg
-        .rope_scaling
-        .map_or((1.0, 1.0, 1.0, 1.0, 1.0, cfg.max_seq_len, 0), |rope| {
-            (
-                rope.factor,
-                rope.mscale,
-                rope.mscale_all_dim,
-                rope.beta_fast,
-                rope.beta_slow,
-                rope.original_max_position_embeddings,
-                1,
-            )
-        });
     let batch = as_i32("attention batch", batch)?;
     let num_heads = as_i32("attention num_heads", cfg.num_heads)?;
     let qk_nope_head_dim = as_i32("attention qk_nope_head_dim", cfg.qk_nope_head_dim)?;
@@ -533,14 +512,11 @@ pub fn dsv2_lite_decode_attention_into(
     let kv_b_rows = as_i32("attention kv_b rows", kv_b.hidden_dim)?;
     let num_slots = as_i32("attention num_slots", num_slots)?;
     let max_seq_len = as_i32("attention max_seq_len", cfg.max_seq_len)?;
-    let rope_original = as_i32(
-        "attention rope original max position embeddings",
-        rope_original,
-    )?;
 
     let (q_ptr, _q_guard) = q.data.device_ptr(&ctx.stream);
     let (kv_a_ptr, _kv_a_guard) = kv_a.data.device_ptr(&ctx.stream);
     let (kv_b_ptr, _kv_b_guard) = kv_b.data.device_ptr(&ctx.stream);
+    let (rope_ptr, _rope_guard) = rope_cos_sin.device_ptr(&ctx.stream);
     let (key_cache_ptr, _key_cache_guard) = key_cache.device_ptr_mut(&ctx.stream);
     let (value_cache_ptr, _value_cache_guard) = value_cache.device_ptr_mut(&ctx.stream);
     let (slot_ids_ptr, _slot_ids_guard) = slot_ids.device_ptr(&ctx.stream);
@@ -566,14 +542,8 @@ pub fn dsv2_lite_decode_attention_into(
             kv_b_rows,
             num_slots,
             max_seq_len,
-            cfg.rope_theta,
-            rope_factor,
-            rope_mscale,
-            rope_mscale_all_dim,
-            rope_beta_fast,
-            rope_beta_slow,
-            rope_original,
-            has_rope_scaling,
+            cfg.softmax_scale,
+            rope_ptr as *const ffi::Half,
             ctx.stream.cu_stream(),
         )
     };

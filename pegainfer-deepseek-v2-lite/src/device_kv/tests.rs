@@ -5,6 +5,7 @@ use pegainfer_kernels::ops::dsv2_lite_kv_norm_into;
 
 use super::DeviceKvPool;
 use super::DeviceKvSlot;
+use super::KERNEL_MAX_DECODE_SEQ_LEN;
 use crate::Config;
 use crate::config::test_lite_config;
 use crate::host_ops::DecodeCache;
@@ -52,11 +53,11 @@ struct StepInputs {
 }
 
 impl StepInputs {
-    fn new(config: &Config, rng: &mut Projections, rows: usize) -> Self {
+    fn new(config: &Config, rng: &mut Projections, rows: usize, scale: f32) -> Self {
         Self {
-            q: rng.values(rows * config.q_proj_rows(), 2.0),
-            kv_a: rng.values(rows * config.kv_a_proj_rows(), 2.0),
-            kv_b: rng.values(rows * config.kv_b_proj_rows(), 2.0),
+            q: rng.values(rows * config.q_proj_rows(), scale),
+            kv_a: rng.values(rows * config.kv_a_proj_rows(), scale),
+            kv_b: rng.values(rows * config.kv_b_proj_rows(), scale),
         }
     }
 
@@ -75,11 +76,16 @@ impl StepInputs {
     }
 }
 
-fn prefill_host_cache(config: &Config, rng: &mut Projections, len: usize) -> DecodeCache {
+fn prefill_host_cache(
+    config: &Config,
+    rng: &mut Projections,
+    len: usize,
+    scale: f32,
+) -> DecodeCache {
     let mut layer = LayerCache::default();
-    let q = to_f32(&rng.values(len * config.q_proj_rows(), 2.0));
-    let kv_a = to_f32(&rng.values(len * config.kv_a_proj_rows(), 2.0));
-    let kv_b = to_f32(&rng.values(len * config.kv_b_proj_rows(), 2.0));
+    let q = to_f32(&rng.values(len * config.q_proj_rows(), scale));
+    let kv_a = to_f32(&rng.values(len * config.kv_a_proj_rows(), scale));
+    let kv_b = to_f32(&rng.values(len * config.kv_b_proj_rows(), scale));
     let mut queries = vec![0.0; len * config.num_attention_heads * config.query_head_dim()];
     append_kv_and_build_queries(config, &q, &kv_a, &kv_b, 0, len, &mut queries, &mut layer);
     DecodeCache {
@@ -108,6 +114,35 @@ fn host_decode_row(
     compute_attention_host(config, &queries, &cache.layers[0], position, 1)
         .into_iter()
         .map(bf16::from_f32)
+        .collect()
+}
+
+fn upload_prefills(
+    ctx: &DeviceContext,
+    config: &Config,
+    pool: &mut DeviceKvPool,
+    caches: &[DecodeCache],
+) -> Vec<DeviceKvSlot> {
+    caches
+        .iter()
+        .map(|cache| {
+            let mut slot = pool.acquire().expect("acquire slot");
+            pool.upload_host_cache(ctx, config, &mut slot, cache)
+                .expect("upload prefill");
+            slot
+        })
+        .collect()
+}
+
+fn host_decode_rows(
+    config: &Config,
+    caches: &mut [DecodeCache],
+    inputs: &StepInputs,
+) -> Vec<Vec<bf16>> {
+    caches
+        .iter_mut()
+        .enumerate()
+        .map(|(row, cache)| host_decode_row(config, cache, inputs.row(config, row)))
         .collect()
 }
 
@@ -224,25 +259,13 @@ fn ragged_decode_rows_match_host_oracle() {
     let prefill_lens = [1usize, 5, 17, 64];
     let mut host_caches: Vec<_> = prefill_lens
         .iter()
-        .map(|&len| prefill_host_cache(&config, &mut rng, len))
+        .map(|&len| prefill_host_cache(&config, &mut rng, len, 2.0))
         .collect();
-    let mut slots: Vec<_> = host_caches
-        .iter()
-        .map(|cache| {
-            let mut slot = pool.acquire().expect("acquire slot");
-            pool.upload_host_cache(&ctx, &config, &mut slot, cache)
-                .expect("upload prefill");
-            slot
-        })
-        .collect();
+    let mut slots = upload_prefills(&ctx, &config, &mut pool, &host_caches);
 
     for step in 0..4 {
-        let inputs = StepInputs::new(&config, &mut rng, slots.len());
-        let host_rows: Vec<_> = host_caches
-            .iter_mut()
-            .enumerate()
-            .map(|(row, cache)| host_decode_row(&config, cache, inputs.row(&config, row)))
-            .collect();
+        let inputs = StepInputs::new(&config, &mut rng, slots.len(), 2.0);
+        let host_rows = host_decode_rows(&config, &mut host_caches, &inputs);
         let mut slot_refs: Vec<_> = slots.iter_mut().collect();
         let device = device_decode_step(&ctx, &config, &mut pool, &mut slot_refs, &inputs);
         assert_rows_match(&config, &device, &host_rows, &format!("step {step}"));
@@ -253,24 +276,53 @@ fn ragged_decode_rows_match_host_oracle() {
 }
 
 #[test]
+fn long_position_decode_rows_match_host_oracle() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let config = one_layer_config();
+    let prefill_lens = [1000usize, 2048, 3500, 4080];
+    for scale in [2.0f32, 0.25] {
+        let mut pool =
+            DeviceKvPool::new(&ctx, &config, 4, KERNEL_MAX_DECODE_SEQ_LEN).expect("device KV pool");
+        let mut rng = Projections::new(4096);
+        let mut host_caches: Vec<_> = prefill_lens
+            .iter()
+            .map(|&len| prefill_host_cache(&config, &mut rng, len, scale))
+            .collect();
+        let mut slots = upload_prefills(&ctx, &config, &mut pool, &host_caches);
+        for step in 0..8 {
+            let inputs = StepInputs::new(&config, &mut rng, slots.len(), scale);
+            let host_rows = host_decode_rows(&config, &mut host_caches, &inputs);
+            let mut slot_refs: Vec<_> = slots.iter_mut().collect();
+            let device = device_decode_step(&ctx, &config, &mut pool, &mut slot_refs, &inputs);
+            assert_rows_match(
+                &config,
+                &device,
+                &host_rows,
+                &format!("scale {scale} step {step}"),
+            );
+        }
+    }
+}
+
+#[test]
 fn reused_slot_ignores_previous_owner_rows() {
     let ctx = DeviceContext::new().expect("create CUDA context");
     let config = one_layer_config();
     let mut pool = DeviceKvPool::new(&ctx, &config, 1, TEST_MAX_SEQ_LEN).expect("device KV pool");
     let mut rng = Projections::new(1089);
 
-    let previous = prefill_host_cache(&config, &mut rng, 96);
+    let previous = prefill_host_cache(&config, &mut rng, 96, 2.0);
     let mut slot = pool.acquire().expect("acquire slot");
     pool.upload_host_cache(&ctx, &config, &mut slot, &previous)
         .expect("upload previous owner");
     drop(slot);
 
-    let mut host_cache = prefill_host_cache(&config, &mut rng, 3);
+    let mut host_cache = prefill_host_cache(&config, &mut rng, 3, 2.0);
     let mut slot = pool.acquire().expect("reacquire released slot");
     assert_eq!(slot.len(), 0);
     pool.upload_host_cache(&ctx, &config, &mut slot, &host_cache)
         .expect("upload new owner");
-    let inputs = StepInputs::new(&config, &mut rng, 1);
+    let inputs = StepInputs::new(&config, &mut rng, 1, 2.0);
     let host_row = host_decode_row(&config, &mut host_cache, inputs.row(&config, 0));
     let device = device_decode_step(&ctx, &config, &mut pool, &mut [&mut slot], &inputs);
     assert_rows_match(&config, &device, &[host_row], "reused slot");
@@ -301,7 +353,7 @@ fn full_slot_is_refused_before_launch() {
     let mut pool = DeviceKvPool::new(&ctx, &config, 1, 4).expect("device KV pool");
     let mut rng = Projections::new(4);
 
-    let cache = prefill_host_cache(&config, &mut rng, 4);
+    let cache = prefill_host_cache(&config, &mut rng, 4, 2.0);
     let mut slot = pool.acquire().expect("acquire slot");
     pool.upload_host_cache(&ctx, &config, &mut slot, &cache)
         .expect("prefill fills the slot exactly");
@@ -311,7 +363,7 @@ fn full_slot_is_refused_before_launch() {
     assert!(format!("{err:#}").contains("is full"), "{err:#}");
 
     drop(slot);
-    let too_long = prefill_host_cache(&config, &mut rng, 5);
+    let too_long = prefill_host_cache(&config, &mut rng, 5, 2.0);
     let mut other = pool.acquire().expect("reacquire released slot");
     let err = pool
         .upload_host_cache(&ctx, &config, &mut other, &too_long)

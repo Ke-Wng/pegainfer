@@ -24,6 +24,7 @@ use crate::device::activate_graph_capture;
 use crate::device::graph_capture_activation_guard;
 use crate::device_kv::attention_config;
 use crate::host_ops::DecodeCache;
+use crate::host_ops::rope_cos_sin_table;
 use crate::model::DenseMlpForwardScratch;
 use crate::model::MlpWeights;
 use crate::model::dense_mlp_forward_preallocated_into;
@@ -45,6 +46,7 @@ struct DecodeGraphProbeState {
     sample_out: CudaSlice<i32>,
     slot_ids: CudaSlice<i32>,
     positions: CudaSlice<i32>,
+    rope_cos_sin: CudaSlice<bf16>,
     layers: Vec<LayerGraphScratch>,
     max_seq_len: usize,
 }
@@ -364,7 +366,7 @@ impl DeepSeekV2LiteEp2Generator {
         let mut current_is_a = true;
         for layer_idx in 0..self.rank0.layers.len() {
             let layer_scratch = &mut state.layers[layer_idx];
-            let metadata = (&state.slot_ids, &state.positions);
+            let metadata = (&state.slot_ids, &state.positions, &state.rope_cos_sin);
             if current_is_a {
                 self.decode_graph_layer_into(
                     layer_idx,
@@ -418,7 +420,7 @@ impl DeepSeekV2LiteEp2Generator {
         &self,
         layer_idx: usize,
         input: &HiddenStates,
-        (slot_ids, positions): (&CudaSlice<i32>, &CudaSlice<i32>),
+        (slot_ids, positions, rope_cos_sin): (&CudaSlice<i32>, &CudaSlice<i32>, &CudaSlice<bf16>),
         scratch: &mut LayerGraphScratch,
         out: &mut HiddenStates,
         max_seq_len: usize,
@@ -467,6 +469,7 @@ impl DeepSeekV2LiteEp2Generator {
             slot_ids,
             positions,
             1,
+            rope_cos_sin,
             &mut scratch.key_cache,
             &mut scratch.value_cache,
             &mut scratch.attn,
@@ -558,6 +561,10 @@ impl DecodeGraphProbeState {
         let sample_out = ctx.stream.alloc_zeros::<i32>(1)?;
         let slot_ids = ctx.stream.alloc_zeros::<i32>(1)?;
         let positions = ctx.stream.alloc_zeros::<i32>(1)?;
+        let rope_cos_sin = ctx
+            .stream
+            .clone_htod(&rope_cos_sin_table(&generator.config, max_seq_len))
+            .context("upload graph probe rope table")?;
 
         if let EpBackendRuntime::Nccl(nccl) = &generator.backend {
             nccl.prepare_graph_shape(ctx, &generator.rank1.ctx, generator.config.hidden_size, 1)?;
@@ -586,6 +593,7 @@ impl DecodeGraphProbeState {
             sample_out,
             slot_ids,
             positions,
+            rope_cos_sin,
             layers,
             max_seq_len,
         })

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
@@ -20,7 +21,9 @@ use super::helpers::append_generated_token;
 use super::helpers::duration_micros;
 use super::helpers::ensure_same_prompt_batch_rows_match;
 use super::helpers::token_sha256;
+use super::load_rollback_value;
 use super::moe::DeviceRoutedMoeRuntime;
+use super::rollback_enabled;
 use super::types::BatchedGenerationResult;
 use super::types::GenerationResult;
 use super::types::GenerationStats;
@@ -34,6 +37,9 @@ use crate::model::DriverRankModel;
 use crate::model::ExpertRankModel;
 use crate::weights::ModelManifest;
 use crate::weights::RankLoadPlan;
+
+static DEVICE_DECODE_ATTENTION_ROLLBACK: LazyLock<std::result::Result<bool, String>> =
+    LazyLock::new(|| load_rollback_value("PEGAINFER_DSV2_LITE_DECODE_ATTENTION", "device", "host"));
 
 impl DeepSeekV2LiteEp2Generator {
     pub fn load(model_path: &Path, options: EngineLoadOptions) -> Result<Self> {
@@ -157,7 +163,11 @@ impl DeepSeekV2LiteEp2Generator {
                 DeviceRoutedMoeRuntime::new(&generator)
                     .context("initialize DeepSeek-V2-Lite device-routed MoE")?,
             ));
-            if let Some(pool) = DeviceKvPool::new_within_budget(
+            if rollback_enabled(&DEVICE_DECODE_ATTENTION_ROLLBACK)? {
+                info!(
+                    "device decode attention disabled by PEGAINFER_DSV2_LITE_DECODE_ATTENTION=host"
+                );
+            } else if let Some(pool) = DeviceKvPool::new_within_budget(
                 &generator.rank0.ctx,
                 &generator.config,
                 DEVICE_KV_SLOTS,

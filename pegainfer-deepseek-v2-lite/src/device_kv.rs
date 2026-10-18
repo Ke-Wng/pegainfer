@@ -12,15 +12,18 @@ use log::warn;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::ops::Dsv2LiteAttentionConfig;
-use pegainfer_kernels::ops::Dsv2LiteRopeScalingConfig;
 use pegainfer_kernels::ops::dsv2_lite_decode_attention_into;
 
 use crate::Config;
 use crate::device::activate;
 use crate::host_ops::DecodeCache;
+use crate::host_ops::attention_softmax_scale;
+use crate::host_ops::rope_cos_sin_table;
 use crate::scheduler::DEFAULT_MAX_ACTIVE_REQUESTS;
 
 pub(crate) const DEVICE_KV_SLOTS: usize = DEFAULT_MAX_ACTIVE_REQUESTS;
+// Mirrors kMaxDecodeSeqLen in dsv2_lite_attention.cu.
+const KERNEL_MAX_DECODE_SEQ_LEN: usize = 4096;
 const DEVICE_MEMORY_UTILIZATION: f64 = 0.9;
 
 pub(crate) fn attention_config(config: &Config, max_seq_len: usize) -> Dsv2LiteAttentionConfig {
@@ -32,18 +35,7 @@ pub(crate) fn attention_config(config: &Config, max_seq_len: usize) -> Dsv2LiteA
         kv_lora_rank: config.kv_lora_rank,
         max_seq_len,
         rms_norm_eps: config.rms_norm_eps,
-        rope_theta: config.rope_theta,
-        rope_scaling: config
-            .rope_scaling
-            .as_ref()
-            .map(|rope| Dsv2LiteRopeScalingConfig {
-                factor: rope.factor,
-                mscale: rope.mscale,
-                mscale_all_dim: rope.mscale_all_dim,
-                beta_fast: rope.beta_fast as f32,
-                beta_slow: rope.beta_slow as f32,
-                original_max_position_embeddings: rope.original_max_position_embeddings,
-            }),
+        softmax_scale: attention_softmax_scale(config),
     }
 }
 
@@ -52,6 +44,7 @@ pub(crate) struct DeviceKvPool {
     values: Vec<CudaSlice<bf16>>,
     slot_ids: CudaSlice<i32>,
     positions: CudaSlice<i32>,
+    rope_cos_sin: CudaSlice<bf16>,
     attention: Dsv2LiteAttentionConfig,
     num_slots: usize,
     key_token_elems: usize,
@@ -91,6 +84,12 @@ impl DeviceKvPool {
         num_slots: usize,
         max_seq_len: usize,
     ) -> Result<Option<Self>> {
+        if max_seq_len > KERNEL_MAX_DECODE_SEQ_LEN {
+            warn!(
+                "device decode KV disabled: max_seq_len {max_seq_len} exceeds the attention kernel limit {KERNEL_MAX_DECODE_SEQ_LEN}; decode stays on host attention"
+            );
+            return Ok(None);
+        }
         let required = Self::bytes_for(config, num_slots, max_seq_len);
         activate(ctx)?;
         let (free, total) = cudarc::driver::result::mem_get_info()
@@ -142,12 +141,17 @@ impl DeviceKvPool {
         }
         let slot_ids = ctx.stream.alloc_zeros::<i32>(num_slots)?;
         let positions = ctx.stream.alloc_zeros::<i32>(num_slots)?;
+        let rope_cos_sin = ctx
+            .stream
+            .clone_htod(&rope_cos_sin_table(config, max_seq_len))
+            .context("upload RoPE cos/sin table")?;
         ctx.sync()?;
         Ok(Self {
             keys,
             values,
             slot_ids,
             positions,
+            rope_cos_sin,
             attention: attention_config(config, max_seq_len),
             num_slots,
             key_token_elems,
@@ -272,6 +276,7 @@ impl DeviceKvPool {
             &self.slot_ids,
             &self.positions,
             self.num_slots,
+            &self.rope_cos_sin,
             &mut self.keys[layer_idx],
             &mut self.values[layer_idx],
             out,

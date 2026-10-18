@@ -11,10 +11,10 @@ use pegainfer_kernels::ops::dsv2_lite_kv_norm_into;
 use pegainfer_kernels::ops::dsv2_lite_router_logits_into;
 use pegainfer_kernels::ops::dsv2_lite_router_softmax_topk_into;
 
-use super::parse_rollback_value;
 use crate::config::test_lite_config;
 use crate::host_ops::gate_logits_host;
 use crate::host_ops::topk_softmax_routes;
+use crate::runtime::parse_rollback_value;
 
 #[test]
 fn rollback_policy_parser_rejects_unknown_values() {
@@ -394,6 +394,10 @@ fn decode_attention_rejects_inflated_q_metadata() {
         .expect("value cache");
     let slot_ids = ctx.stream.clone_htod(&[0i32]).expect("slot ids H2D");
     let positions = ctx.stream.clone_htod(&[0i32]).expect("positions H2D");
+    let rope_cos_sin = ctx
+        .stream
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.qk_rope_head_dim)
+        .expect("rope table");
 
     let err = dsv2_lite_decode_attention_into(
         &ctx,
@@ -404,6 +408,7 @@ fn decode_attention_rejects_inflated_q_metadata() {
         &slot_ids,
         &positions,
         1,
+        &rope_cos_sin,
         &mut key_cache,
         &mut value_cache,
         &mut out,
@@ -434,6 +439,10 @@ fn decode_attention_rejects_inflated_output_metadata() {
         .expect("value cache");
     let slot_ids = ctx.stream.clone_htod(&[0i32]).expect("slot ids H2D");
     let positions = ctx.stream.clone_htod(&[0i32]).expect("positions H2D");
+    let rope_cos_sin = ctx
+        .stream
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.qk_rope_head_dim)
+        .expect("rope table");
 
     let err = dsv2_lite_decode_attention_into(
         &ctx,
@@ -444,6 +453,7 @@ fn decode_attention_rejects_inflated_output_metadata() {
         &slot_ids,
         &positions,
         1,
+        &rope_cos_sin,
         &mut key_cache,
         &mut value_cache,
         &mut out,
@@ -645,8 +655,7 @@ fn tiny_attention_config() -> Dsv2LiteAttentionConfig {
         kv_lora_rank: 1,
         max_seq_len: 2,
         rms_norm_eps: 1.0e-6,
-        rope_theta: 10_000.0,
-        rope_scaling: None,
+        softmax_scale: 0.5,
     }
 }
 

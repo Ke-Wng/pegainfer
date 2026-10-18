@@ -123,14 +123,8 @@ unsafe extern "C" {
         kv_b_rows: i32,
         num_slots: i32,
         max_seq_len: i32,
-        rope_theta: f32,
-        rope_factor: f32,
-        rope_mscale: f32,
-        rope_mscale_all_dim: f32,
-        rope_beta_fast: f32,
-        rope_beta_slow: f32,
-        rope_original_max_position_embeddings: i32,
-        has_rope_scaling: i32,
+        softmax_scale: f32,
+        rope_cos_sin: *const Half,
         stream: CUstream,
     ) -> CUresult;
 }

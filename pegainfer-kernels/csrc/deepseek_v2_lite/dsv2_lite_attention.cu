@@ -2,7 +2,6 @@
 #include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
-#include <cfloat>
 #include <math_constants.h>
 
 namespace {
@@ -19,82 +18,45 @@ __device__ __forceinline__ float bf16_round(float value) {
   return __bfloat162float(__float2bfloat16(value));
 }
 
-__device__ __forceinline__ float yarn_get_mscale(float scale, float mscale) {
-  if (scale <= 1.0f) return 1.0f;
-  return 0.1f * mscale * logf(scale) + 1.0f;
-}
+// The softmax must use the same exp as the host attention oracle, or probabilities
+// differ in the last bit and can flip greedy near-ties. The host's f32::exp calls
+// glibc expf, and CUDA expf differs from it on ~9% of softmax inputs, so host_expf
+// ports glibc's sysdeps/ieee754/flt-32/e_expf.c (FMA build) with its 2^(i/32)
+// table. It is exhaustively bitwise-equal to glibc 2.39 for x in [-103.97, 0].
+__constant__ unsigned long long kExp2fTable[32] = {
+    0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
+    0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
+    0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d,
+    0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585,
+    0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13,
+    0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+    0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069,
+    0x3fef5818dcfba487, 0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540};
 
-__device__ __forceinline__ float yarn_find_correction_dim(
-    float num_rotations,
-    int dim,
-    float base,
-    float factor,
-    int original_max_position_embeddings) {
-  return static_cast<float>(dim) *
-         logf(static_cast<float>(original_max_position_embeddings) /
-              (num_rotations * 2.0f * CUDART_PI_F)) /
-         (2.0f * logf(base));
-}
-
-__device__ __forceinline__ float rope_inv_freq(
-    int pair,
-    int rope_dim,
-    float base,
-    int has_rope_scaling,
-    float factor,
-    float beta_fast,
-    float beta_slow,
-    int original_max_position_embeddings) {
-  float freq_extra = 1.0f / powf(base, static_cast<float>(2 * pair) / rope_dim);
-  if (!has_rope_scaling) return freq_extra;
-
-  float freq_inter = freq_extra / factor;
-  float low =
-      floorf(fmaxf(0.0f, yarn_find_correction_dim(beta_fast, rope_dim, base, factor,
-                                                  original_max_position_embeddings)));
-  float high = ceilf(fminf(static_cast<float>(rope_dim - 1),
-                           yarn_find_correction_dim(beta_slow, rope_dim, base, factor,
-                                                    original_max_position_embeddings)));
-  float ramp;
-  if (fabsf(high - low) < FLT_EPSILON) {
-    ramp = static_cast<float>(pair) <= low ? 0.0f : 1.0f;
-  } else {
-    ramp = fminf(1.0f, fmaxf(0.0f, (static_cast<float>(pair) - low) / (high - low)));
-  }
-  float inv_freq_mask = 1.0f - ramp;
-  return freq_inter * (1.0f - inv_freq_mask) + freq_extra * inv_freq_mask;
-}
-
-__device__ __forceinline__ float rope_mscale(
-    int has_rope_scaling,
-    float factor,
-    float mscale,
-    float mscale_all_dim) {
-  if (!has_rope_scaling) return 1.0f;
-  return yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim);
+__device__ __forceinline__ float host_expf(float x) {
+  constexpr double kInvLn2N = 0x1.71547652b82fep+0 * 32;
+  constexpr double kShift = 0x1.8p+52;
+  constexpr double kC0 = 0x1.c6af84b912394p-5 / 32 / 32 / 32;
+  constexpr double kC1 = 0x1.ebfce50fac4f3p-3 / 32 / 32;
+  constexpr double kC2 = 0x1.62e42ff0c52d6p-1 / 32;
+  if (x < -0x1.9fe368p6f) return 0.0f;
+  double xd = x;
+  double kd = __dadd_rn(__dmul_rn(kInvLn2N, xd), kShift);
+  unsigned long long ki = static_cast<unsigned long long>(__double_as_longlong(kd));
+  kd = __dsub_rn(kd, kShift);
+  double r = __fma_rn(kInvLn2N, xd, -kd);
+  double s = __longlong_as_double(static_cast<long long>(kExp2fTable[ki % 32] + (ki << 47)));
+  double y = __fma_rn(__fma_rn(kC0, r, kC1), __dmul_rn(r, r), __fma_rn(kC2, r, 1.0));
+  return __double2float_rn(__dmul_rn(y, s));
 }
 
 __device__ __forceinline__ void apply_rope_pair(
     float x0,
     float x1,
-    int pair,
-    int pos,
-    int rope_dim,
-    float rope_theta,
-    int has_rope_scaling,
-    float rope_factor,
-    float rope_mscale_value,
-    float rope_beta_fast,
-    float rope_beta_slow,
-    int rope_original_max_position_embeddings,
+    float cos_value,
+    float sin_value,
     float *out0,
     float *out1) {
-  float angle = static_cast<float>(pos) *
-                rope_inv_freq(pair, rope_dim, rope_theta, has_rope_scaling, rope_factor,
-                              rope_beta_fast, rope_beta_slow,
-                              rope_original_max_position_embeddings);
-  float cos_value = bf16_round(cosf(angle) * rope_mscale_value);
-  float sin_value = bf16_round(sinf(angle) * rope_mscale_value);
   float x0_cos = bf16_round(x0 * cos_value);
   float neg_x1_sin = bf16_round(-x1 * sin_value);
   float x1_cos = bf16_round(x1 * cos_value);
@@ -158,14 +120,8 @@ __global__ void decode_attention_kernel(
     int kv_b_rows,
     int num_slots,
     int max_seq_len,
-    float rope_theta,
-    float rope_factor,
-    float rope_mscale_arg,
-    float rope_mscale_all_dim,
-    float rope_beta_fast,
-    float rope_beta_slow,
-    int rope_original_max_position_embeddings,
-    int has_rope_scaling) {
+    float softmax_scale,
+    const __nv_bfloat16 *__restrict__ rope_cos_sin) {
   int head = blockIdx.x;
   int row = blockIdx.y;
   int tid = threadIdx.x;
@@ -187,8 +143,8 @@ __global__ void decode_attention_kernel(
     return;
   }
   int kv_len = position + 1;
-  float rope_scale = rope_mscale(has_rope_scaling, rope_factor, rope_mscale_arg,
-                                 rope_mscale_all_dim);
+  const __nv_bfloat16 *position_cos_sin =
+      rope_cos_sin + static_cast<size_t>(position) * qk_rope_head_dim;
 
   const __nv_bfloat16 *row_q = q + static_cast<size_t>(row) * q_rows;
   const __nv_bfloat16 *row_kv_a = kv_a + static_cast<size_t>(row) * kv_a_rows;
@@ -215,9 +171,8 @@ __global__ void decode_attention_kernel(
     float k1 = __bfloat162float(row_kv_a[kv_lora_rank + 2 * pair + 1]);
     float k_out0;
     float k_out1;
-    apply_rope_pair(k0, k1, pair, position, qk_rope_head_dim, rope_theta, has_rope_scaling,
-                    rope_factor, rope_scale, rope_beta_fast, rope_beta_slow,
-                    rope_original_max_position_embeddings, &k_out0, &k_out1);
+    apply_rope_pair(k0, k1, __bfloat162float(position_cos_sin[2 * pair]),
+                    __bfloat162float(position_cos_sin[2 * pair + 1]), &k_out0, &k_out1);
     // apply_rope_pair rounds to bf16, so these stores are exact.
     new_key[qk_nope_head_dim + pair] = __float2bfloat16(k_out0);
     new_key[qk_nope_head_dim + pair + qk_rope_head_dim / 2] = __float2bfloat16(k_out1);
@@ -237,9 +192,8 @@ __global__ void decode_attention_kernel(
     float q1 = __bfloat162float(row_q[q_base + 2 * pair + 1]);
     float q_out0;
     float q_out1;
-    apply_rope_pair(q0, q1, pair, position, qk_rope_head_dim, rope_theta, has_rope_scaling,
-                    rope_factor, rope_scale, rope_beta_fast, rope_beta_slow,
-                    rope_original_max_position_embeddings, &q_out0, &q_out1);
+    apply_rope_pair(q0, q1, __bfloat162float(position_cos_sin[2 * pair]),
+                    __bfloat162float(position_cos_sin[2 * pair + 1]), &q_out0, &q_out1);
     query[qk_nope_head_dim + pair] = q_out0;
     query[qk_nope_head_dim + pair + qk_rope_head_dim / 2] = q_out1;
   }
@@ -247,11 +201,6 @@ __global__ void decode_attention_kernel(
   __syncthreads();
 
   float local_max = -CUDART_INF_F;
-  float scale = rsqrtf(static_cast<float>(q_head_dim));
-  if (has_rope_scaling && rope_mscale_all_dim > 0.0f) {
-    float mscale = yarn_get_mscale(rope_factor, rope_mscale_all_dim);
-    scale *= mscale * mscale;
-  }
 
   for (int pos = tid; pos < kv_len; pos += blockDim.x) {
     const __nv_bfloat16 *key = slot_keys + pos * key_token_stride + head * q_head_dim;
@@ -259,7 +208,7 @@ __global__ void decode_attention_kernel(
     for (int dim = 0; dim < q_head_dim; ++dim) {
       dot = __fadd_rn(dot, __fmul_rn(query[dim], __bfloat162float(key[dim])));
     }
-    float score = bf16_round(bf16_round(dot) * scale);
+    float score = bf16_round(bf16_round(dot) * softmax_scale);
     scores[pos] = score;
     local_max = fmaxf(local_max, score);
   }
@@ -279,7 +228,7 @@ __global__ void decode_attention_kernel(
   __syncthreads();
 
   for (int pos = tid; pos < kv_len; pos += blockDim.x) {
-    scores[pos] = expf(scores[pos] - max_score);
+    scores[pos] = host_expf(scores[pos] - max_score);
   }
   __syncthreads();
   if (tid == 0) {
@@ -354,17 +303,12 @@ CUresult dsv2_lite_decode_attention_cuda(
     int kv_b_rows,
     int num_slots,
     int max_seq_len,
-    float rope_theta,
-    float rope_factor,
-    float rope_mscale,
-    float rope_mscale_all_dim,
-    float rope_beta_fast,
-    float rope_beta_slow,
-    int rope_original_max_position_embeddings,
-    int has_rope_scaling,
+    float softmax_scale,
+    const __nv_bfloat16 *rope_cos_sin,
     cudaStream_t stream) {
   if (q == nullptr || kv_a == nullptr || kv_b == nullptr || key_cache == nullptr ||
-      value_cache == nullptr || slot_ids == nullptr || positions == nullptr || out == nullptr) {
+      value_cache == nullptr || slot_ids == nullptr || positions == nullptr || out == nullptr ||
+      rope_cos_sin == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (batch <= 0 || num_heads <= 0 || qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 ||
@@ -380,9 +324,7 @@ CUresult dsv2_lite_decode_attention_cuda(
   decode_attention_kernel<<<grid, kAttentionThreads, 0, stream>>>(
       q, kv_a, kv_b, key_cache, value_cache, slot_ids, positions, out, num_heads,
       qk_nope_head_dim, qk_rope_head_dim, v_head_dim, kv_lora_rank, kv_a_rows, kv_b_rows,
-      num_slots, max_seq_len, rope_theta, rope_factor, rope_mscale, rope_mscale_all_dim,
-      rope_beta_fast, rope_beta_slow, rope_original_max_position_embeddings,
-      has_rope_scaling);
+      num_slots, max_seq_len, softmax_scale, rope_cos_sin);
   return consume_last_cuda_error();
 }
 

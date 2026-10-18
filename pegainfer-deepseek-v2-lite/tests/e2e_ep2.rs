@@ -1127,6 +1127,10 @@ fn current_backend() -> String {
     env::var("PEGAINFER_DSV2_LITE_EP_BACKEND").unwrap_or_else(|_| "host-staged".to_string())
 }
 
+fn host_decode_attention() -> bool {
+    env::var("PEGAINFER_DSV2_LITE_DECODE_ATTENTION").is_ok_and(|value| value.trim() == "host")
+}
+
 fn validate_device_decode_steps(
     stats: &pegainfer_deepseek_v2_lite::GenerationStats,
     expected_steps: usize,
@@ -1135,12 +1139,13 @@ fn validate_device_decode_steps(
     let steps = stats.device_decode_steps;
     let valid = match stats.ep_backend.as_str() {
         "host-staged" => steps == 0,
-        "nccl" => steps == 0 || steps == expected_steps,
+        "nccl" if host_decode_attention() => steps == 0,
+        "nccl" => steps == expected_steps,
         _ => false,
     };
     ensure!(
         valid,
-        "{label} device decode steps: got {steps}, expected 0 for host-staged or 0/{expected_steps} for NCCL; backend={}",
+        "{label} device decode steps: got {steps}, expected 0 for host-staged or PEGAINFER_DSV2_LITE_DECODE_ATTENTION=host, {expected_steps} for NCCL; backend={}",
         stats.ep_backend
     );
     Ok(())
