@@ -18,11 +18,13 @@ __device__ __forceinline__ float bf16_round(float value) {
   return __bfloat162float(__float2bfloat16(value));
 }
 
-// The softmax must use the same exp as the host attention oracle, or probabilities
-// differ in the last bit and can flip greedy near-ties. The host's f32::exp calls
-// glibc expf, and CUDA expf differs from it on ~9% of softmax inputs, so host_expf
-// ports glibc's sysdeps/ieee754/flt-32/e_expf.c (FMA build) with its 2^(i/32)
-// table. It is exhaustively bitwise-equal to glibc 2.39 for x in [-103.97, 0].
+// Softmax needs the host oracle's exp: CUDA expf differs on ~9% of inputs and can
+// flip greedy near-ties. Adapted for nonpositive inputs from Arm optimized-routines
+// math/expf.c and math/exp2f_data.c (N = 32).
+// Copyright (c) 2017-2025, Arm Limited.
+// Copyright (c) 2017-2018, Arm Limited.
+// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
+// Exhaustively bitwise-equal to glibc 2.39 x86_64 (FMA build) expf for x in [-103.97, 0].
 __constant__ unsigned long long kExp2fTable[32] = {
     0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
     0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,

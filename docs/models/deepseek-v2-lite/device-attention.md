@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Device Attention
 
-> **TL;DR:** On the NCCL backend, steady decode keeps attention, the KV cache, and every RMSNorm on rank 0's GPU, with one slot of a fixed bf16 KV pool per request, so rows at different positions share one decode step. Attention stays bitwise-equal to the host oracle, and TPOT on the #466 short HTTP contract drops 72-74%. Prefill still runs on the host (#452).
+> **TL;DR:** On the NCCL backend, steady decode keeps attention, the KV cache, and every RMSNorm on rank 0's GPU, with one slot of a fixed bf16 KV pool per request, so rows at different positions share one decode step. Attention stays bitwise-equal to the host oracle, and TPOT on the #466 short HTTP contract drops about 72%. Prefill still runs on the host (#452).
 
 Last touched: 2026-10
 
@@ -27,7 +27,7 @@ each decode step:
   advance every slot by one token
 ```
 
-`DeviceKvPool` owns per-layer K and V buffers laid out `[slot][position][head][dim]`, with K at 192 dims per head (128 nope + 64 rope) and V at 128. It stores expanded per-head K/V. The 512-wide compressed latent is only an intermediate projection. Eight slots x 4096 tokens x 27 layers is about 8.4 GiB of bf16 on rank 0. The slot count is tied to the scheduler's active-request cap.
+`DeviceKvPool` owns per-layer K and V buffers laid out `[slot][position][head][dim]`, with K at 192 dims per head (128 nope + 64 rope) and V at 128. It stores expanded per-head K/V. The 512-wide compressed latent is only an intermediate projection. Eight slots x 4096 tokens x 27 layers is about 8.4 GiB of bf16 on rank 0. The slot count is tied to the scheduler's active-request cap. A paged pool can later replace the fixed slot behind the same `DeviceKvSlot` handle, so request ownership stays unchanged.
 
 Startup builds the pool only if the configured context fits the kernel's 4096-position limit and current usage plus the pool stays within 90% of rank 0's memory, the same default as Qwen3's `gpu_memory_utilization`; otherwise it logs a warning and leaves NCCL decode on host attention. Rank 0 weights take about 15.9 GiB, so by static estimate 24 GiB cards take the fallback and 32 GiB cards fit. The 90% margin is a convention, not a measured peak, and only 40 GiB cards have run the device path.
 
@@ -40,8 +40,10 @@ Startup builds the pool only if the configured context fits the kernel's 4096-po
 Device attention is bitwise-equal to the host attention oracle at every position up to the 4096 limit, because a last-bit difference can flip a greedy near-tie. The kernel therefore computes nothing whose result could differ from the host:
 
 - RoPE cos/sin come from a table the host builds with its own code. Device math differed in the last bit, and large positions amplified it.
-- The softmax scale comes from the host, and the softmax `exp` is a port of glibc's `expf`, which the host uses.
+- The softmax scale comes from the host, and the softmax `exp` uses the same algorithm as the host's libm `expf`, from [Arm optimized-routines](https://github.com/ARM-software/optimized-routines/blob/master/math/expf.c).
 - Products and sums are unfused and in host order. The first version used a tree-reduced RMSNorm and flipped the `Hello` case (`19 year old` vs `20 year old`).
+
+Bitwise equality was verified on x86_64 with glibc 2.39 (FMA build), on A100. With non-FMA glibc or aarch64 glibc 2.38, one input (`x = -0x1.f8cbb2p+5`, probability around 1e-28) differs by 1 ulp, so bitwise equality is not guaranteed there.
 
 This contract covers attention only. The NCCL backend as a whole is not bitwise-equal to host-staged, because its device-routed MoE uses batched cuBLAS GEMMs ([device-routed-moe.md](device-routed-moe.md)). Long prompts can therefore diverge at greedy near-ties on main as well.
 
@@ -61,31 +63,32 @@ On those long prompts, both NCCL modes diverge from host-staged at the same toke
 
 ## Performance Validation
 
-HTTP A/B compared main (`353cebf8`) with this branch on two idle A100 40 GB GPUs, NCCL, CUDA Graph off. It used the #466 short contract: about 85 prompt tokens, 64 output tokens, 32 requests, three repeats ([benchmarking.md](benchmarking.md#retained-http-slo-profiles)). Cells are medians.
+HTTP A/B compared main (`353cebf8`) with this branch (`8f0f2f0b6b03`) on two idle A100 40 GB GPUs, NCCL, CUDA Graph off. It used the #466 short contract: about 85 prompt tokens, 64 output tokens, 32 requests, one run per concurrency ([benchmarking.md](benchmarking.md#retained-http-slo-profiles)).
 
 | Concurrency | Main TPOT p50 | Branch TPOT p50 | TPOT change | Main output tok/s | Branch output tok/s | Main TTFT p50 | Branch TTFT p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 54.8 ms | 15.3 ms | -72.1% | 13.1 | 28.1 | 1413 ms | 1319 ms |
-| 4 | 228.1 ms | 58.9 ms | -74.2% | 14.8 | 36.3 | 2868 ms | 3319 ms |
-| 8 | 440.6 ms | 116.5 ms | -73.6% | 15.5 | 38.2 | 5674 ms | 6032 ms |
+| 1 | 54.8 ms | 15.3 ms | -72.1% | 13.2 | 25.5 | 1398 ms | 1525 ms |
+| 4 | 220.2 ms | 62.8 ms | -71.5% | 14.7 | 32.6 | 3533 ms | 3822 ms |
+| 8 | 442.9 ms | 124.2 ms | -72.0% | 15.5 | 35.0 | 5559 ms | 6761 ms |
 
-All requests completed with identical output hashes, and the #453 reliability runner passed on both binaries. The trace splits the TTFT rise at concurrency 4/8:
+All requests completed with identical output hashes and no failures, timeouts, or missing traces. The #453 reliability runner passed on both binaries. The trace splits the TTFT rise at concurrency 4/8:
 
-- Prefill is unchanged.
-- The rise is all queue wait: c4 goes from 1461 to 1982 ms and c8 from 4254 to 4669 ms.
+- Prefill is unchanged; the rise is all queue wait (c4: 2137 → 2278 ms, c8: 4178 → 5271 ms).
 - Rows that decode together finish together, so their successors queue for serial host prefill. That belongs with #452.
 
 The mixed and long profiles were not compared because host prefill dominates them.
 
-Direct decode (`Hello` prompt, 16 output tokens) on one binary was also measured, with the switch alternated three times. Output hashes were identical. Every row shares one position here, so this excludes the scheduler gain.
+Direct decode (`Hello` prompt, 16 output tokens) was also measured on one binary, one run per mode using the switch. Output hashes were identical. Every row shares one position here, so this excludes the scheduler gain.
 
 | Decode batch | Host attention | Device attention | Change |
 | ---: | ---: | ---: | ---: |
-| 1 | 29.2 ms | 24.1 ms | -17.7% |
-| 4 | 53.0 ms | 35.3 ms | -33.5% |
-| 8 | 85.9 ms | 49.1 ms | -42.9% |
+| 1 | 29.5 ms | 24.8 ms | -16.0% |
+| 4 | 55.3 ms | 35.2 ms | -36.4% |
+| 8 | 89.5 ms | 50.4 ms | -43.7% |
 
-Over 512 short requests of turnover, rank 0 VRAM and server RSS stayed flat after the first round. The batch-1 graph probe verifies all replays with the new kernel. The serving decode step still runs eager, because it allocates per-layer scratch.
+At batch 8, attribution puts every decode layer's attention under `attention_device_path`. The only `attention_host_path` calls left are prefill (8 prompts x 27 layers, #452).
+
+Over 512 completed short requests, rank 0 VRAM went from 25,591 to 25,615 MiB (max 25,615), rank 1 from 14,471 to 14,495 MiB (max 14,495), and server RSS from 877.2 to 1,169.2 MiB (max 1,194.2). VRAM stayed flat after the first round. The batch-1 graph probe verifies all replays with the new kernel. The serving decode step still runs eager, because it allocates per-layer scratch.
 
 ## Follow-Up Work
 
