@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Device Attention
 
-> **TL;DR:** On the NCCL backend, steady decode keeps attention, the KV cache, and every RMSNorm on rank 0's GPU, with one slot of a fixed bf16 KV pool per request, so rows at different positions share one decode step. Attention stays bitwise-equal to the host oracle, and TPOT on the #466 short HTTP contract drops about 72%. Prefill still runs on the host (#452).
+> **TL;DR:** On the NCCL backend, steady decode keeps attention, the KV cache, and every RMSNorm on rank 0's GPU, with one slot of a fixed bf16 KV pool per request, so rows at different positions share one decode step. Attention stays bitwise-equal to the host oracle, and TPOT on the #466 short HTTP contract drops 70-75%. Prefill still runs on the host (#452).
 
 Last touched: 2026-10
 
@@ -63,28 +63,33 @@ On those long prompts, both NCCL modes diverge from host-staged at the same toke
 
 ## Performance Validation
 
-HTTP A/B compared main (`353cebf8`) with this branch (`8f0f2f0b6b03`) on two idle A100 40 GB GPUs, NCCL, CUDA Graph off. It used the #466 short contract: about 85 prompt tokens, 64 output tokens, 32 requests, one run per concurrency ([benchmarking.md](benchmarking.md#retained-http-slo-profiles)).
+HTTP A/B compared main (`353cebf8`) with this branch (`91c345367561`) on two idle A100 40 GB GPUs, NCCL, CUDA Graph off. It used the #466 short contract: about 85 prompt tokens, 64 output tokens, 32 requests per concurrency, three paired repeats ([benchmarking.md](benchmarking.md#retained-http-slo-profiles)). Values are median (min-max) across three repeats; percentage changes compare medians.
 
 | Concurrency | Main TPOT p50 | Branch TPOT p50 | TPOT change | Main output tok/s | Branch output tok/s | Main TTFT p50 | Branch TTFT p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 54.8 ms | 15.3 ms | -72.1% | 13.2 | 25.5 | 1398 ms | 1525 ms |
-| 4 | 220.2 ms | 62.8 ms | -71.5% | 14.7 | 32.6 | 3533 ms | 3822 ms |
-| 8 | 442.9 ms | 124.2 ms | -72.0% | 15.5 | 35.0 | 5559 ms | 6761 ms |
+| 1 | 50.80 (49.84-52.82) ms | 15.26 (15.25-15.26) ms | -70.0% | 14.2 (13.9-14.4) | 30.5 (29.0-30.7) | 1281 (1269-1291) ms | 1119 (1102-1223) ms |
+| 4 | 216.97 (208.35-223.50) ms | 54.77 (54.03-55.87) ms | -74.8% | 16.0 (15.5-16.1) | 39.4 (38.6-41.0) | 2567 (2546-2681) ms | 2943 (2797-3049) ms |
+| 8 | 422.13 (401.17-431.48) ms | 110.69 (106.02-110.72) ms | -73.8% | 16.5 (16.3-17.1) | 40.7 (40.7-43.2) | 4968 (4067-5206) ms | 5591 (5180-5636) ms |
 
-All requests completed with identical output hashes and no failures, timeouts, or missing traces. The #453 reliability runner passed on both binaries. The trace splits the TTFT rise at concurrency 4/8:
+All requests completed with identical output hashes across modes and repeats, with no failures, timeouts, or missing traces. The #453 reliability runner passed on both binaries. The trace reports median (min-max) of per-run p50 in ms, main → branch:
 
-- Prefill is unchanged; the rise is all queue wait (c4: 2137 → 2278 ms, c8: 4178 → 5271 ms).
-- Rows that decode together finish together, so their successors queue for serial host prefill. That belongs with #452.
+| Concurrency | Queue wait | Prefill | Scheduled-to-first-token |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.6 (2.5-3.1) → 1.8 (1.6-1.8) | 1274.7 (1264.1-1286.0) → 1114.4 (1098.2-1219.3) | 1274.7 (1264.1-1286.0) → 1114.4 (1098.2-1219.3) |
+| 4 | 1305.5 (1291.9-1372.7) → 1734.5 (1642.1-1817.3) | 1260.3 (1233.2-1315.1) → 1204.4 (1140.7-1239.4) | 1260.3 (1233.3-1315.1) → 1204.4 (1140.7-1239.4) |
+| 8 | 3732.4 (2772.9-3929.2) → 4336.9 (3984.4-4359.2) | 1291.2 (1238.5-1303.2) → 1236.5 (1146.2-1245.1) | 1291.2 (1238.5-1303.2) → 1236.5 (1146.2-1245.1) |
 
-The mixed and long profiles were not compared because host prefill dominates them.
+Prefill timing includes `attach_device_kv` cache conversion, GPU upload and synchronization. Scheduled-to-first-token includes prefill and excludes queue wait. KV upload was not timed separately.
 
-Direct decode (`Hello` prompt, 16 output tokens) was also measured on one binary, one run per mode using the switch. Output hashes were identical. Every row shares one position here, so this excludes the scheduler gain.
+The mixed and long-prompt profiles were not compared.
+
+Direct decode (`Hello` prompt, 16 output tokens) was also measured on one binary, three paired runs per batch using the switch. Output hashes were identical. Every row shares one position here, so this excludes the scheduler gain.
 
 | Decode batch | Host attention | Device attention | Change |
 | ---: | ---: | ---: | ---: |
-| 1 | 29.5 ms | 24.8 ms | -16.0% |
-| 4 | 55.3 ms | 35.2 ms | -36.4% |
-| 8 | 89.5 ms | 50.4 ms | -43.7% |
+| 1 | 27.05 (26.73-27.17) ms | 23.59 (23.23-25.05) ms | -12.8% |
+| 4 | 50.99 (50.43-51.68) ms | 35.14 (34.55-37.25) ms | -31.1% |
+| 8 | 81.15 (79.88-81.92) ms | 48.76 (48.76-51.74) ms | -39.9% |
 
 At batch 8, attribution puts every decode layer's attention under `attention_device_path`. The only `attention_host_path` calls left are prefill (8 prompts x 27 layers, #452).
 
